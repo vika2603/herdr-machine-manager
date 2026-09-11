@@ -92,3 +92,7 @@ just logs    # what herdr recorded about each plugin command
 
 `just --list` has the rest. `docs/design.md` explains why the plugin is built
 the way it is.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
