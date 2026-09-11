@@ -4,14 +4,14 @@
 
 id = "herdr.machine-manager"
 name = "Machine Manager"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Manage SSH machines and their connections"
 # Windows is left out: the add job runs herdr machine add under a PTY.
 platforms = ["linux", "macos"]
 
 [[build]]
-command = ["go", "build", "-o", "bin/machine-manager", "./cmd/machine-manager"]
+command = ["./scripts/build.sh"]
 
 # Not supervised by herdr: the daemon keeps itself alive, and the action and
 # the pane start one if the socket is silent.

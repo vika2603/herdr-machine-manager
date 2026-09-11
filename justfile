@@ -51,3 +51,12 @@ daemon-log:
 # The connections the plugin manages.
 connections:
     cat {{state_dir}}/connections.json
+
+# Cross-compile the release binaries and record the checksums build.sh checks.
+dist:
+    rm -rf dist && mkdir -p dist
+    for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do \
+        CGO_ENABLED=0 GOOS=${target%-*} GOARCH=${target#*-} \
+            go build -trimpath -o dist/machine-manager-$target ./cmd/machine-manager; \
+    done
+    cd dist && shasum -a 256 machine-manager-* > ../scripts/checksums.txt
