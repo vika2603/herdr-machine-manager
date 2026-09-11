@@ -1,0 +1,105 @@
+# Cuts a release: builds the binary for every supported platform, records the
+# checksums build.sh verifies against, and publishes the tag.
+#
+# The checksums have to reach the repository before the tag exists, because
+# scripts/build.sh reads them out of the checkout rather than off the release.
+# That is why this is dispatched with a version instead of triggered by a tag:
+# the workflow writes the version into the manifest, commits the checksums,
+# and tags the commit it just made.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.1.2)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -o "dist/machine-manager-${GOOS}-${GOARCH}" ./cmd/machine-manager
+      - uses: actions/upload-artifact@v4
+        with:
+          name: machine-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/machine-manager-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Refuse an existing tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "v${VERSION} already exists" >&2
+            exit 1
+          fi
+      - name: Record the version and the checksums
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          chmod +x dist/machine-manager-*
+          (cd dist && sha256sum machine-manager-*) > scripts/checksums.txt
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" herdr-plugin.toml
+          cat scripts/checksums.txt
+      - name: Commit, tag and release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add herdr-plugin.toml scripts/checksums.txt
+          git diff --cached --quiet || git commit -m "Release ${VERSION}"
+          git tag -a "v${VERSION}" -m "Machine Manager ${VERSION}"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+          git push origin "v${VERSION}"
+          gh release create "v${VERSION}" \
+            --title "Machine Manager ${VERSION}" \
+            --generate-notes \
+            dist/machine-manager-*

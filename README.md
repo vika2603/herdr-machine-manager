@@ -22,8 +22,9 @@ Install builds the binary from source when a Go toolchain is present, and
 otherwise downloads the binary attached to the release that matches the
 manifest version, accepting it only if its SHA-256 matches
 [`scripts/checksums.txt`](scripts/checksums.txt) in the checkout. Release
-binaries are published for macOS and Linux on amd64 and arm64. `herdr plugin
-link` runs no build command; build the working tree yourself with `just build`.
+binaries are built by the `release` workflow for macOS and Linux on amd64 and
+arm64. `herdr plugin link` runs no build command; build the working tree
+yourself with `just build`.
 
 Then bind a key in `~/.config/herdr/config.toml` and reload:
 
@@ -95,11 +96,20 @@ just check   # build, test with -race, vet and lint
 just link    # build and point herdr at this working tree
 just open    # open the popup without pressing the key
 just logs    # what herdr recorded about each plugin command
-just dist    # cross-compile the release binaries and refresh the checksums
 ```
 
 `just --list` has the rest. `docs/design.md` explains why the plugin is built
 the way it is.
+
+## Releases
+
+```bash
+gh workflow run release.yml -f version=0.1.2
+```
+
+The workflow builds the binary for every supported platform, writes the version
+into the manifest, commits the checksums `scripts/build.sh` verifies against,
+tags that commit and publishes the release.
 
 ## License
 
