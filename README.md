@@ -14,7 +14,7 @@ Requires herdr 0.9.0 or newer, on macOS or Linux.
 ## Install
 
 ```bash
-herdr plugin install <owner>/<repo>      # once published
+herdr plugin install vika2603/herdr-machine-manager
 herdr plugin link /path/to/this/checkout # or from a working tree
 ```
 
