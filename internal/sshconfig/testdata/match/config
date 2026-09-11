@@ -1,0 +1,8 @@
+Host before-match
+
+Match host before-match exec "true"
+  User matched
+  Include match-only/*.conf
+
+Host after-match
+  User plain

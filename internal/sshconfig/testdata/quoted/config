@@ -1,0 +1,4 @@
+Host "quoted"
+  HostName "example.net"
+
+Host "quoted-first" plain-second

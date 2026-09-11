@@ -1,0 +1,7 @@
+Host shared-alias
+  User first
+
+Include extra.conf
+
+Host shared-alias
+  User second

@@ -1,0 +1,23 @@
+# Machine Manager settings.
+#
+# Copy this file to the plugin's own config directory, which herdr reports:
+#
+#   herdr plugin config-dir herdr.machine-manager
+#
+# and name it config.toml. Every setting is optional; the values below are the
+# defaults. The plugin only reads this file.
+
+# Popup size, overriding the manifest. A percentage is quoted, a cell count is
+# a bare number: popup_width = 96
+# popup_width = "55%"
+# popup_height = "50%"
+
+# Default of the "install herdr on the remote if it is missing" switch in the
+# add form. Turning it off means a remote without herdr stops and asks.
+# install_remote = true
+
+# Where the ssh aliases come from. Unset means OpenSSH's own default.
+# ssh_config = "~/.ssh/config"
+
+# herdr toasts when a job finishes or needs an answer.
+# notifications = true

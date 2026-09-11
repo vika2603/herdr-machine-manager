@@ -1,0 +1,6 @@
+Host=equals-host
+HostName=example.com
+
+Host = spaced-host
+
+Include=inc/*.conf

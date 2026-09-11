@@ -1,0 +1,17 @@
+# a comment line
+	# an indented comment
+
+Host pi
+  HostName 10.0.0.5
+
+Host proxy proxy-tunnel
+  HostName 203.0.113.20
+
+Host *
+  ServerAliveInterval 30
+
+Host *.example.com web?
+  User nobody
+
+Host !secret shared
+  User nobody

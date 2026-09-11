@@ -1,0 +1,35 @@
+# Manages herdr's saved SSH machines. One binary serves three entrypoints: the
+# resident daemon that owns the job queue, the action bound to a key, and the
+# popup pane that runs the TUI. See docs/design.md.
+
+id = "herdr.machine-manager"
+name = "Machine Manager"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Manage SSH machines and their connections"
+# Windows is left out: the add job runs herdr machine add under a PTY.
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["go", "build", "-o", "bin/machine-manager", "./cmd/machine-manager"]
+
+# Not supervised by herdr: the daemon keeps itself alive, and the action and
+# the pane start one if the socket is silent.
+[[startup]]
+command = ["./bin/machine-manager"]
+
+[[panes]]
+id = "manager"
+title = "Machines"
+description = "Browse and manage the saved SSH machines"
+placement = "popup"
+width = "55%"
+height = "50%"
+command = ["./bin/machine-manager"]
+
+[[actions]]
+id = "open"
+title = "Manage machines"
+description = "Open the machine manager popup"
+contexts = ["global", "workspace"]
+command = ["./bin/machine-manager"]
