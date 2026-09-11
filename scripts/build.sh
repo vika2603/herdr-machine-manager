@@ -41,7 +41,16 @@ if [ -z "$expected" ]; then
 	exit 1
 fi
 
-if ! curl -fsSL -o "$target.tmp" "$url"; then
+if command -v curl >/dev/null 2>&1; then
+	fetch() { curl -fsSL -o "$1" "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+	fetch() { wget -q -O "$1" "$2"; }
+else
+	echo "build.sh: no Go toolchain, and neither curl nor wget to fetch the release binary" >&2
+	exit 1
+fi
+
+if ! fetch "$target.tmp" "$url"; then
 	rm -f "$target.tmp"
 	echo "build.sh: could not download $url" >&2
 	exit 1
