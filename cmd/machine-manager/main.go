@@ -1,7 +1,6 @@
 // Command machine-manager is the Herdr plugin that manages SSH machines.
-// One binary serves three manifest entrypoints: the resident daemon that owns
-// the machine cache and the job queue, the action that opens the popup, and
-// the popup pane that runs the TUI. See docs/design.md.
+// One binary serves the resident daemon, the manager action and pane, and a
+// compact prompt pane. See docs/design.md.
 package main
 
 import (
@@ -20,6 +19,7 @@ import (
 // Entrypoint ids herdr-plugin.toml declares.
 const (
 	paneManager = "manager"
+	panePrompt  = "prompt"
 	actionOpen  = "open"
 )
 
@@ -35,6 +35,7 @@ func newPlugin() *plugin.Plugin {
 	p.Startup(onStartup)
 	p.Action(actionOpen, onOpen)
 	p.Pane(paneManager, onManager)
+	p.Pane(panePrompt, onPrompt)
 	return p
 }
 
@@ -71,6 +72,15 @@ func onOpen(ctx context.Context, env *plugin.Env) error {
 // exit, not a failed plugin command.
 func onManager(ctx context.Context, env *plugin.Env) error {
 	err := ui.Run(ctx, env)
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+// onPrompt shows a compact input popup for a background job awaiting input.
+func onPrompt(ctx context.Context, env *plugin.Env) error {
+	err := ui.RunPrompt(ctx, env)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}

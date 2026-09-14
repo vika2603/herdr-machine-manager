@@ -13,7 +13,8 @@
 # popup_height = "50%"
 
 # Default of the "install herdr on the remote if it is missing" switch in the
-# add form. Turning it off means a remote without herdr stops and asks.
+# add form. When enabled, installation asks for confirmation in a popup.
+# Turning it off declines installation on a remote without herdr.
 # install_remote = true
 
 # Where the ssh aliases come from. Unset means OpenSSH's own default.

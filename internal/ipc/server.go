@@ -92,6 +92,14 @@ func (s *Server) Broadcast(name string, data any) {
 	}
 }
 
+// HasSubscribers reports whether a plugin popup is currently listening for
+// job updates. Herdr allows only one popup at a time.
+func (s *Server) HasSubscribers() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subs) > 0
+}
+
 // subscribers reports how many subscriptions are open, for tests that check
 // they are released.
 func (s *Server) subscribers() int {

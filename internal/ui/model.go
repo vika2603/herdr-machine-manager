@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -65,6 +64,7 @@ type model struct {
 
 	// editing is the connection the form is editing, empty when it creates one.
 	editing                string
+	formBack               screen
 	label, target, session textinput.Model
 	field                  int
 	install                bool
@@ -72,7 +72,8 @@ type model struct {
 
 	confirm *daemon.Connection
 
-	jobInput textinput.Model
+	dialog           *promptDialog
+	dismissedPrompts map[string]bool
 }
 
 func newModel(ctx context.Context, client *herdr.Client) model {
@@ -90,7 +91,6 @@ func newModel(ctx context.Context, client *herdr.Client) model {
 		label:       input("label shown in the sidebar"),
 		target:      input("ssh target"),
 		session:     input("remote session (optional)"),
-		jobInput:    input("answer"),
 	}
 }
 
@@ -104,6 +104,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.offset = scroll(m.offset, m.cursor, m.rows())
+		m.aliasOffset = scroll(m.aliasOffset, m.aliasCursor, m.aliasRows())
 		return m, nil
 
 	case listMsg:
@@ -147,6 +149,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "reconnecting to the daemon"
 		return m, m.loadList()
 
+	case promptReplyMsg:
+		if m.dialog != nil && m.dialog.jobID == msg.jobID && m.dialog.prompt == msg.prompt {
+			m.dialog.sending = false
+			if msg.err != nil {
+				m.dialog.failure = msg.err.Error()
+			} else {
+				m.dismissPrompt()
+				m.syncPrompt()
+			}
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.key(msg)
 	}
@@ -166,9 +180,6 @@ func (m *model) forgetOutputs() {
 	}
 }
 
-// secretPrompt recognises the prompts whose answer must not be echoed.
-var secretPrompt = regexp.MustCompile(`(?i)(password|passphrase|secret|token)`)
-
 // mergeJobs replaces the known jobs with the set the daemon keeps. Its tails
 // come from the daemon, which saw everything, so they replace what the popup
 // buffered: a reconnect would otherwise keep showing what it had before the
@@ -182,6 +193,7 @@ func (m *model) mergeJobs(list []jobs.Job) {
 		}
 	}
 	m.forgetOutputs()
+	m.syncPrompt()
 }
 
 // activeJobs is the set of jobs still in flight.
@@ -214,12 +226,8 @@ func (m *model) mergeJob(job jobs.Job) {
 		m.failure = job.Title + ": " + job.Err
 	case jobs.StateSucceeded:
 		m.status = job.Title + " finished"
-	case jobs.StateAwaitingInput:
-		m.jobInput.EchoMode = textinput.EchoNormal
-		if secretPrompt.MatchString(job.Prompt) {
-			m.jobInput.EchoMode = textinput.EchoPassword
-		}
 	}
+	m.syncPrompt()
 }
 
 func (m model) current() (daemon.Connection, bool) {
@@ -265,19 +273,21 @@ func (m model) jobFor(id string) (jobs.Job, bool) {
 	return jobs.Job{}, false
 }
 
-// rows is how many body rows fit between the header and the footer: the
-// header, two rules, the help line and the status line. It must match what
-// page() lays out, or the scroll window and the render window disagree and the
-// last rows never come into view.
+// rows uses the same footer height as page so paging keeps the cursor visible.
 func (m model) rows() int {
 	if m.height <= 0 {
 		return 10
 	}
-	return max(3, m.height-5)
+	return max(1, m.bodyRows(listHelp))
 }
 
 // aliasRows is the picker's window, which also carries the filter line.
-func (m model) aliasRows() int { return max(3, m.rows()-1) }
+func (m model) aliasRows() int {
+	if m.height <= 0 {
+		return 9
+	}
+	return max(1, m.bodyRows(aliasHelp)-1)
+}
 
 // scroll keeps the cursor inside the visible window.
 func scroll(offset, cursor, rows int) int {

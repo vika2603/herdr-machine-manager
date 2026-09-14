@@ -1,6 +1,5 @@
-# Manages herdr's saved SSH machines. One binary serves three entrypoints: the
-# resident daemon that owns the job queue, the action bound to a key, and the
-# popup pane that runs the TUI. See docs/design.md.
+# Manages herdr's saved SSH machines. One binary serves the resident daemon,
+# the manager action, the manager pane, and a small input popup.
 
 id = "herdr.machine-manager"
 name = "Machine Manager"
@@ -25,6 +24,15 @@ description = "Browse and manage the saved SSH machines"
 placement = "popup"
 width = "55%"
 height = "50%"
+command = ["./bin/machine-manager"]
+
+[[panes]]
+id = "prompt"
+title = "SSH input"
+description = "Answer a waiting SSH connection prompt"
+placement = "popup"
+width = 64
+height = 13
 command = ["./bin/machine-manager"]
 
 [[actions]]

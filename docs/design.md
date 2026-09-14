@@ -252,18 +252,22 @@ alias picker → form (label, target, remote session, install?)
   → daemon queues a connect job; the popup is free to close
   → `herdr machine add …` under a PTY
   → output streams to whoever is subscribed
-  → on a known prompt: answer from the choice the user already made
-  → on an unknown prompt: state = awaiting_input, notification.show
+  → if installation was disabled: decline its installation prompt
+  → otherwise: state = awaiting_input, open compact prompt pane if UI is closed
   → terminal state: notification.show, reload and reconcile, which is where the
     connection learns the endpoint id it was given
 ```
 
-**Prompt handling.** The daemon matches a small, explicit set of expected
-prompts against the PTY tail: the install confirmation, and the
-incompatible-server replacement question, which keeps herdr's own default of No.
-Password and passphrase prompts are never auto-answered. Anything else moves the
-job to `awaiting_input` and notifies — the daemon never guesses at an answer it
-was not given.
+**Prompt handling.** Explicitly disabled installation is declined. Other
+questions move the job to `awaiting_input`. When no UI is subscribed, the daemon
+opens the separate `prompt` pane (64 by 13 cells), without the manager list or
+its footer. It handles questions from live events or the initial snapshot and
+closes when all have been answered or dismissed. An already-open manager shows
+the modal in place, respecting Herdr's single-popup limit.
+Confirmations offer No / Yes with No selected;
+passwords and passphrases use a masked input. Unknown questions use text input.
+The pending question is identified by job and prompt text, so background updates
+do not clear a draft and dismissed questions do not repeatedly take focus.
 
 A prompt is the unterminated text output stopped on. It stops being a prompt
 when that line ends, not when any output arrives: a command that prints progress
@@ -273,8 +277,8 @@ while it waits must not clear the input field the user is typing into.
 alias resolves, `ssh -o BatchMode=yes -o ConnectTimeout=5 <target> true` to
 learn whether the host authenticates without a prompt, and
 `ssh -o BatchMode=yes <target> 'command -v herdr'` to learn whether the remote
-already has herdr. Today the form asks whether installing is allowed and the
-daemon replies with that answer.
+already has herdr. The form controls whether installing is allowed; permitted
+installation still requires confirmation when the command asks.
 
 **Cancellation** signals the process group, and sends SIGKILL after a grace
 period: a command that ignores SIGTERM would otherwise hold its connection's
@@ -340,12 +344,12 @@ when a change to an active connection's target means reconnecting it.
 **Confirm** — for `forget`, saying whether the connection is also being removed
 from herdr, and that sessions already running on that host keep running.
 
-**Output** — what the command behind one connection is doing, and where an
-answer it is waiting for is typed. It is a line view over the PTY tail with ANSI
-stripped, not a terminal emulator; a prompt asking for a password, passphrase,
-secret or token switches the input to a masked field.
+**Details** — saved connection settings, resolved address when known, and the
+latest task state and output. Interactive questions appear in a centered modal
+above the current screen; dismissing it preserves the underlying selection or
+form. Enter on a waiting connection opens its question again.
 
-Every screen is laid out the same way — header, rule, body, rule, help, status —
+Every screen is laid out the same way — header, rule, body, status, rule, help —
 and the body is cut to the rows the popup actually has. The program does not use
 the alternate screen, so a frame taller than the pane would scroll its own top
 away.

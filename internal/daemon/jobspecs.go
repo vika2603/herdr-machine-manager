@@ -81,33 +81,32 @@ func (d *Daemon) forgetSpec(conn store.Connection) jobs.Spec {
 	}
 }
 
-// Prompts herdr machine add is known to ask. Anything outside this set moves
-// the job to awaiting_input rather than being answered on the user's behalf; a
-// password prompt is never answered here.
+// Installation explicitly disabled by the caller is the only prompt answered
+// here. All other questions, including stopping an incompatible remote server,
+// move to awaiting_input for the user to decide.
 var (
-	installPrompt = regexp.MustCompile(`(?i)install(ing)? the remote herdr binary\?`)
-	replacePrompt = regexp.MustCompile(`(?i)stop .*server.*\?`)
+	installPrompt      = regexp.MustCompile(`(?i)install(ing)? the remote herdr binary\?`)
+	installAssetPrompt = regexp.MustCompile(`(?i)\binstall the [0-9][^\r\n?]*\basset for [a-z0-9_-]+ to ["']?[^"'\r\n?]*/herdr["']?\?`)
 )
 
 func addAnswers(install bool) []jobs.Answer {
-	reply := "n\n"
 	if install {
-		reply = "y\n"
+		return nil
 	}
 	return []jobs.Answer{
-		{Match: installPrompt, Reply: reply},
-		// Replacing an incompatible remote server is herdr's own destructive
-		// default-No question; the plugin keeps that default.
-		{Match: replacePrompt, Reply: "n\n"},
+		{Match: installPrompt, Reply: "n\n"},
+		{Match: installAssetPrompt, Reply: "n\n"},
 	}
 }
 
 func (d *Daemon) onJobUpdate(job jobs.Job) {
 	d.broadcast(ipc.EventJobUpdated, job)
 	if job.State == jobs.StateAwaitingInput {
+		d.requestAttention(job)
 		d.notify("SSH machines: input needed", job.Title+" — "+job.Prompt)
 		return
 	}
+	d.clearAttention(job.ID)
 	if !job.State.Terminal() {
 		return
 	}

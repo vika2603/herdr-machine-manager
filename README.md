@@ -47,23 +47,49 @@ connection, `○` means only this plugin does.
 
 | Key | Action |
 | --- | --- |
-| `a` | Add a connection, picking an alias from `~/.ssh/config` |
-| `e` | Edit the selected connection: label, SSH target, remote session |
+| `↑` / `↓`, `Ctrl+P` / `Ctrl+N` | Move through connections |
+| `PageUp` / `PageDown` | Move by one visible page |
+| `Home` / `End` | Jump to the first / last connection |
+| `Ctrl+A` / `Insert` | Add a connection, picking an alias from `~/.ssh/config` |
+| `Ctrl+E` | Edit the selected connection: label, SSH target, remote session |
 | `space` | Connect or disconnect |
-| `enter` | Show what the command behind that connection is doing |
-| `d` | Forget it, removing it from herdr too |
-| `R` | Reload |
-| `q` | Close the popup |
+| `Enter` | Show the selected connection's details and latest command output |
+| `Delete` | Open the forget confirmation; `Enter` confirms, `Esc` cancels |
+| `Ctrl+R` | Reload |
+| `Esc` | Close the popup |
+
+The alias picker supports arrows, `Ctrl+N` / `Ctrl+P`, and paging while you type
+to filter. `Ctrl+A` / `Ctrl+E` move to the start / end of the filter text.
+`Ctrl+Home` / `Ctrl+End` jump to the first / last alias; plain `Home` / `End`
+move within the filter text. In forms, `Tab` / `Shift+Tab`, `↓` / `↑`, or
+`Ctrl+N` / `Ctrl+P` move between fields. `Space` toggles the focused checkbox;
+`Enter` or `Ctrl+S` saves. `Esc` returns to the screen that opened the form.
+
+In connection details, `Ctrl+E` opens the edit form when no answer is being
+typed. `Ctrl+X` cancels an unfinished job, including one waiting for input.
+Confirmation dialogs use `Tab` or arrows to select No / Yes and `Enter` to
+submit; No is initially selected. Password dialogs hide the typed characters.
+In input dialogs, `Ctrl+A` / `Ctrl+E` move within the answer. `Esc` dismisses a
+dialog for later without answering or cancelling the job; select that connection
+and press `Enter` to reopen it. `Ctrl+C` closes the popup from any screen.
+The earlier letter shortcuts remain available for compatibility. The footer
+shows only the most common actions on one line, with fewer hints in narrow
+popups. All shortcuts listed above remain available.
 
 Connecting runs `herdr machine add`, which prepares the remote host and can take
 minutes. It runs in the background: the row shows `connecting…`, the popup can
-be closed, and a herdr toast reports the result. If the command asks something
-the plugin was not told to answer — a password, an unexpected confirmation — the
-row turns into `needs an answer` and `enter` opens the place to type it.
+be closed, and a herdr toast reports the result. When the command needs a
+confirmation, password or another answer, a compact standalone input popup opens
+without the manager list. It identifies the connection and closes after the last
+answer or dismissal. If the manager is already open, it shows the question in
+place. Multiple questions are shown one at a time. Dismissing a question does
+not repeatedly reopen it.
 
 The form asks up front whether installing herdr on a remote that lacks it is
-allowed, and that answer is what the plugin replies with when `machine add`
-asks. Passwords are never answered on your behalf.
+allowed. When allowed, the actual installation still asks for confirmation;
+when disabled, the daemon declines installation. Replacing an incompatible
+remote server also requires confirmation. Passwords are never answered on your
+behalf.
 
 A machine added outside the plugin, with `herdr machine add` on a command line,
 is adopted into the list rather than ignored.
@@ -76,7 +102,7 @@ in this repository lists the same settings.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `popup_width`, `popup_height` | `"55%"`, `"50%"` | Popup size. A quoted percentage or a bare cell count. |
+| `popup_width`, `popup_height` | `"55%"`, `"50%"` | Manager popup size. The standalone input popup uses its compact manifest size. |
 | `install_remote` | `true` | Starting position of the install switch in the form. |
 | `ssh_config` | OpenSSH's default | Where the aliases are read from. |
 | `notifications` | `true` | Whether a finished or blocked job raises a herdr toast. |

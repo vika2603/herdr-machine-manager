@@ -26,6 +26,11 @@ var (
 // defaultCols is used until the first resize message arrives.
 const defaultCols = 72
 
+const (
+	listHelp  = "Ctrl+A add · Ctrl+E edit · Space toggle · Enter details · Esc close"
+	aliasHelp = "Enter select · Esc back"
+)
+
 // cols is the width to lay out for. A narrow popup is laid out narrow rather
 // than overflowing it, so rules and rows never wrap.
 func (m model) cols() int {
@@ -36,8 +41,8 @@ func (m model) cols() int {
 }
 
 // page lays out every screen the same way: a header with a right-aligned
-// summary, a rule, the body, a rule, and the key hints with the status line
-// under them.
+// summary, a rule, the body, and a bottom-aligned footer. Status messages sit
+// above the footer rule so the key hints always occupy the last row.
 func (m model) page(title, summary string, body []string, help string) string {
 	w := m.cols()
 	rule := dimStyle.Render(strings.Repeat("─", w))
@@ -48,30 +53,61 @@ func (m model) page(title, summary string, body []string, help string) string {
 	}
 
 	footer := m.footer()
+	helpLines := m.helpLines(help)
 
 	// The popup is a fixed number of rows and the program does not use the
 	// alternate screen, so a frame taller than the pane would scroll the top
 	// of it away. The body is cut to what is left after the chrome.
 	if m.height > 0 {
-		chrome := 4 // header, two rules, help
-		if footer != "" {
-			chrome++
-		}
-		if room := m.height - chrome; room < len(body) {
-			body = body[:max(0, room)]
-		}
+		room := m.bodyRows(help)
+		visibleBody := make([]string, room)
+		copy(visibleBody, body)
+		body = visibleBody
 	}
 
 	out := []string{head, rule}
 	out = append(out, body...)
-	out = append(out, rule, dimStyle.Render(help))
 	if footer != "" {
 		out = append(out, footer)
+	}
+	out = append(out, rule)
+	for _, line := range helpLines {
+		out = append(out, dimStyle.Render(line))
+	}
+	if m.height > 0 && len(out) > m.height {
+		out = out[len(out)-m.height:]
 	}
 	return strings.Join(out, "\n")
 }
 
+// Keep the footer to one quiet line. Drop secondary hints first in narrow
+// panes, retaining the primary action and the way back for as long as they fit.
+func (m model) helpLines(help string) []string {
+	hints := strings.Split(help, " · ")
+	for len(hints) > 1 && lipgloss.Width(strings.Join(hints, " · ")) > m.cols() {
+		i := len(hints) - 2
+		hints = append(hints[:i], hints[i+1:]...)
+	}
+	return []string{lipgloss.NewStyle().MaxWidth(m.cols()).Render(strings.Join(hints, " · "))}
+}
+
+func (m model) bodyRows(help string) int {
+	chrome := 3 + len(m.helpLines(help)) // header and two rules
+	if m.footer() != "" {
+		chrome++
+	}
+	return max(0, m.height-chrome)
+}
+
 func (m model) View() string {
+	base := m.viewScreen()
+	if m.dialog != nil {
+		return m.viewPrompt(base)
+	}
+	return base
+}
+
+func (m model) viewScreen() string {
 	switch m.screen {
 	case screenAliases:
 		return m.viewAliases()
@@ -87,16 +123,16 @@ func (m model) View() string {
 }
 
 func (m model) viewList() string {
+	m.offset = scroll(m.offset, m.cursor, m.rows())
 	var body []string
 	if len(m.conns) == 0 {
 		body = append(body, "", dimStyle.Render("  no connections yet"),
-			dimStyle.Render("  press a to add one from ~/.ssh/config"))
+			dimStyle.Render("  press Ctrl+A to add one from ~/.ssh/config"))
 	}
 	for i, conn := range visible(m.conns, m.offset, m.rows()) {
 		body = append(body, m.connRow(m.offset+i, conn))
 	}
-	return m.page("SSH connections", m.counts(), body,
-		"a add · e edit · space connect/disconnect · enter details · d forget · q close")
+	return m.page("SSH connections", m.counts(), body, listHelp)
 }
 
 // connRow shows the stored connection and, when something is happening to it,
@@ -178,6 +214,7 @@ func (m model) counts() string {
 
 func (m model) viewAliases() string {
 	list := m.filtered()
+	m.aliasOffset = scroll(m.aliasOffset, m.aliasCursor, m.aliasRows())
 	body := []string{" " + accentStyle.Render("filter") + " " + m.aliasFilter.View()}
 
 	if len(list) == 0 {
@@ -198,8 +235,7 @@ func (m model) viewAliases() string {
 	}
 
 	summary := fmt.Sprintf("%d of %d aliases", len(list), len(m.aliases))
-	return m.page("Add a connection — pick an alias", summary, body,
-		"↑↓ move · enter select · type to filter · esc cancel")
+	return m.page("Add a connection — pick an alias", summary, body, aliasHelp)
 }
 
 func (m model) savedTarget(name string) bool {
@@ -229,10 +265,10 @@ func (m model) viewForm() string {
 		field(0, "Label", m.label.View()),
 		field(1, "SSH target", m.target.View()),
 		field(2, "Session", m.session.View()),
-		field(3, "", box+" install herdr on the remote if it is missing"),
+		field(3, "", box+" allow remote herdr install (asks first)"),
 		"",
 		dimStyle.Render("  $ " + truncate(strings.Join(m.previewArgs(), " "), m.cols()-4)),
-		dimStyle.Render("  runs in the background; you can close this popup"),
+		dimStyle.Render("  runs in background; questions open a small popup"),
 	}
 
 	title, summary := "Add a connection", ""
@@ -242,7 +278,7 @@ func (m model) viewForm() string {
 			summary = "target changed — will reconnect"
 		}
 	}
-	return m.page(title, summary, body, "tab next · space toggle · enter save · esc back")
+	return m.page(title, summary, body, "Enter save · Tab field · Esc back")
 }
 
 // previewArgs shows the command the daemon will run, so the form is not a
@@ -277,42 +313,71 @@ func (m model) viewConfirm() string {
 		"",
 		dimStyle.Render(note),
 	}
-	return m.page("Forget a connection", "", body, "y forget · n cancel")
+	return m.page("Forget a connection", "", body, "Enter forget · Esc cancel")
 }
 
-// viewOutput shows what the command behind the selected connection is doing.
+// viewOutput always shows the saved connection settings, with task output below
+// them when available.
 func (m model) viewOutput() string {
 	conn, ok := m.current()
 	if !ok {
 		return m.viewList()
 	}
+	field := func(name, value string) string {
+		return "  " + dimStyle.Render(pad(name, 11)) + value
+	}
+	session := conn.Session
+	if session == "" {
+		session = dimStyle.Render("(default)")
+	}
+	state := dimStyle.Render("disconnected")
+	if conn.Active {
+		state = okStyle.Render("connected")
+	}
+	body := []string{
+		field("Label", conn.Label),
+		field("SSH target", conn.Target),
+		field("Session", session),
+		field("State", state),
+	}
+	if alias, found := m.aliasFor(conn.Target); found && alias.Host != "" {
+		body = append(body, field("Address", endpoint(alias.User, alias.Host, alias.Port)))
+	}
+	help := "Ctrl+E edit · Esc back"
 	job, hasJob := m.lastJobFor(conn.ID)
 	if !hasJob {
-		body := []string{"", dimStyle.Render("  nothing has run for this connection yet")}
-		return m.page(conn.Label, conn.Target, body, "esc back")
+		return m.page("Connection details", "", body, help)
 	}
-
-	body := []string{""}
-	for _, line := range m.tail(job) {
+	if !job.State.Terminal() {
+		help = "Ctrl+E edit · Ctrl+X cancel job · Esc back"
+	}
+	if job.State == jobs.StateAwaitingInput {
+		help = "Enter answer · Ctrl+E edit · Esc back"
+	}
+	body = append(body, "", field("Task", stateLabel(job)))
+	var prompt []string
+	if job.State == jobs.StateAwaitingInput {
+		prompt = []string{"  " + warnStyle.Render(job.Prompt), dimStyle.Render("  Press Enter to answer")}
+	}
+	rows := outputTail
+	if m.height > 0 {
+		// Reserve the answer prompt before allocating space to settings and
+		// logs, so a short pane can still answer an interactive job.
+		room := max(0, m.bodyRows(help)-len(prompt))
+		body = body[:min(len(body), room)]
+		rows = room - len(body)
+	}
+	for _, line := range m.tail(job, rows) {
 		body = append(body, dimStyle.Render("  "+truncate(line, m.cols()-4)))
 	}
-
-	help := "esc back · x cancel"
-	if job.State == jobs.StateAwaitingInput {
-		body = append(body, "", "  "+warnStyle.Render(job.Prompt), "  "+m.jobInput.View())
-		help = "enter answer · esc back · x cancel"
-	}
-	return m.page(conn.Label, stateLabel(job), body, help)
+	body = append(body, prompt...)
+	return m.page("Connection details", "", body, help)
 }
 
 // tail is the output buffered for a job: the lines streamed while the popup
 // was open, seeded from the daemon's own copy when the list was read.
-func (m model) tail(job jobs.Job) []string {
+func (m model) tail(job jobs.Job, rows int) []string {
 	lines := m.outputs[job.ID]
-	rows := outputTail
-	if m.height > 0 {
-		rows = max(3, m.height-9)
-	}
 	if len(lines) > rows {
 		lines = lines[len(lines)-rows:]
 	}

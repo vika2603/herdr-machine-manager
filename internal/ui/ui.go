@@ -24,6 +24,18 @@ const reconnectDelay = time.Second
 // Run starts the daemon if it is not up, then runs the TUI until the popup
 // closes.
 func Run(ctx context.Context, env *plugin.Env) error {
+	return run(ctx, env, false)
+}
+
+// RunPrompt displays only pending questions, then closes. It connects to the
+// daemon that owns the waiting PTY; Ensure preserves compatible busy daemons.
+func RunPrompt(ctx context.Context, env *plugin.Env) error {
+	return run(ctx, env, true)
+}
+
+func run(ctx context.Context, env *plugin.Env, promptOnly bool) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if err := daemon.Ensure(ctx, env); err != nil {
 		return err
 	}
@@ -40,7 +52,11 @@ func Run(ctx context.Context, env *plugin.Env) error {
 	// No alternate screen: the popup is a pane herdr destroys when it closes,
 	// so there is no scrollback to protect, and staying on the main screen
 	// keeps the view readable to pane.read.
-	program := tea.NewProgram(model, tea.WithContext(ctx))
+	var initial tea.Model = model
+	if promptOnly {
+		initial = promptModel{model: model}
+	}
+	program := tea.NewProgram(initial, tea.WithContext(ctx))
 	go stream(ctx, client, program)
 	_, err := program.Run()
 	if ctx.Err() != nil {

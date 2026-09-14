@@ -67,15 +67,6 @@ func (m model) act(method, id string, install bool) tea.Cmd {
 	}
 }
 
-func (m model) sendInput(jobID, data string) tea.Cmd {
-	return func() tea.Msg {
-		if err := m.client.Call(m.ctx, ipc.MethodJobInput, ipc.InputParams{JobID: jobID, Data: data}, nil); err != nil {
-			return failureMsg(err.Error())
-		}
-		return statusMsg("sent")
-	}
-}
-
 func (m model) cancel(jobID string) tea.Cmd {
 	return func() tea.Msg {
 		if err := m.client.Call(m.ctx, ipc.MethodJobCancel, ipc.JobTarget{JobID: jobID}, nil); err != nil {

@@ -60,13 +60,13 @@ func TestMergeJobReportsAFailure(t *testing.T) {
 }
 
 func TestMergeJobMasksASecretPrompt(t *testing.T) {
-	m := model{outputs: map[string][]string{}, jobInput: textinput.New()}
+	m := model{outputs: map[string][]string{}}
 	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateAwaitingInput, Prompt: "alice@host password:"})
-	if m.jobInput.EchoMode != textinput.EchoPassword {
+	if m.dialog == nil || m.dialog.input.EchoMode != textinput.EchoPassword {
 		t.Error("a password prompt must not echo what is typed")
 	}
-	m.mergeJob(jobs.Job{ID: "job-2", ConnID: "c1", State: jobs.StateAwaitingInput, Prompt: "continue? [y/N]"})
-	if m.jobInput.EchoMode != textinput.EchoNormal {
+	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateAwaitingInput, Prompt: "continue? [y/N]"})
+	if m.dialog == nil || m.dialog.input.EchoMode != textinput.EchoNormal {
 		t.Error("an ordinary prompt should echo")
 	}
 }

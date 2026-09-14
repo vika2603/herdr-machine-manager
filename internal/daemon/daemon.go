@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vika2603/herdr-client/herdr"
 	"github.com/vika2603/herdr-client/plugin"
 
 	"github.com/vika2603/herdr-machine-manager/internal/config"
@@ -30,7 +31,7 @@ import (
 // Version is the build the daemon reports over ping. A TUI from a newer build
 // asks an older daemon to step aside, which is what makes a rebuild take
 // effect without restarting herdr.
-const Version = "0.3.0"
+const Version = "0.5.0"
 
 // pollInterval is how often herdr's saved-machines file is checked for a
 // change made outside the plugin. Job-driven changes reload directly, so this
@@ -63,6 +64,14 @@ type Daemon struct {
 	aliases   []sshconfig.Alias
 	aliasRead time.Time
 	aliasMod  time.Time
+
+	attentionMu           sync.Mutex
+	attentionPrompts      map[string]string
+	attentionPending      map[string]jobs.Job
+	attentionOpening      bool
+	attentionOpeningUntil time.Time
+	attentionReplayActive bool
+	attentionOpen         func(context.Context, herdr.PluginPaneOpenParams) error
 }
 
 // ListResult is the reply to connections.list.
