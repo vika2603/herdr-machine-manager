@@ -53,15 +53,15 @@ func onOpen(ctx context.Context, env *plugin.Env) error {
 	params := herdr.PluginPaneOpenParams{
 		PluginID:   env.PluginID,
 		Entrypoint: paneManager,
-		Focus:      herdr.Ptr(true),
+		Focus:      herdr.Some(true),
 	}
 	// A size in the user's config overrides the manifest's.
 	if cfg, err := config.Load(env.ConfigDir); err == nil {
 		if width, ok := config.ParseSize(cfg.PopupWidth); ok {
-			params.Width = &width
+			params.Width = herdr.Some(width)
 		}
 		if height, ok := config.ParseSize(cfg.PopupHeight); ok {
-			params.Height = &height
+			params.Height = herdr.Some(height)
 		}
 	}
 	_, err := env.Client().PluginPaneOpen(ctx, params)

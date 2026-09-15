@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/creack/pty v1.1.24
-	github.com/vika2603/herdr-client v0.1.1
+	github.com/vika2603/herdr-client v0.2.0
 )
 
 require (

@@ -133,6 +133,6 @@ func (d *Daemon) notify(title, body string) {
 	defer cancel()
 	_, _ = d.env.Client().NotificationShow(ctx, herdr.NotificationShowParams{
 		Title: title,
-		Body:  herdr.Ptr(body),
+		Body:  herdr.Some(body),
 	})
 }

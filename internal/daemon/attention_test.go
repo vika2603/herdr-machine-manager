@@ -78,10 +78,10 @@ func TestRequestAttentionOpensOnceForClosedPopup(t *testing.T) {
 	job := awaitPrompt("job-1")
 	d.requestAttention(job)
 	p := waitAttention(t, calls)
-	if p.PluginID != d.env.PluginID || p.Entrypoint != "prompt" || !herdr.Value(p.Focus) {
+	if p.PluginID != d.env.PluginID || p.Entrypoint != "prompt" || !p.Focus.ValueOrZero() {
 		t.Errorf("popup params = %+v", p)
 	}
-	if p.Width != nil || p.Height != nil {
+	if p.Width.IsSet() || p.Height.IsSet() {
 		t.Errorf("prompt popup inherited manager size overrides: %+v", p)
 	}
 	d.requestAttention(job)

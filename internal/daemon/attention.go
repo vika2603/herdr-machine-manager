@@ -70,7 +70,7 @@ func (d *Daemon) launchAttentionLocked(job jobs.Job) {
 		params := herdr.PluginPaneOpenParams{
 			PluginID:   d.env.PluginID,
 			Entrypoint: "prompt",
-			Focus:      herdr.Ptr(true),
+			Focus:      herdr.Some(true),
 		}
 		open := d.attentionOpen
 		if open == nil {
@@ -132,7 +132,7 @@ func (d *Daemon) notifyAttentionOpenFailure(job jobs.Job, openErr error) {
 	defer cancel()
 	_, err := d.env.Client().NotificationShow(ctx, herdr.NotificationShowParams{
 		Title: "SSH machines: input needed",
-		Body:  herdr.Ptr(job.Title + " — open the manager manually (" + openErr.Error() + ")"),
+		Body:  herdr.Some(job.Title + " — open the manager manually (" + openErr.Error() + ")"),
 	})
 	if err != nil {
 		log.Printf("daemon: cannot notify about waiting job %s: %v", job.ID, err)
