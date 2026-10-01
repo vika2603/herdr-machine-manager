@@ -139,19 +139,20 @@ func (m model) panelWidth() int {
 
 type hint struct{ key, action string }
 
-// frame lays out every screen the same way: a header with the title badge and
-// the counts, the body, a status line, and one line of key hints. Without the
+// frame lays out every screen the same way: a header with the counts (Herdr
+// already sets the pane title into the popup border), the body, a status line, and one line of key hints. Without the
 // alternate screen a taller frame would scroll its own top away, so the frame
 // is exactly the pane's size and no line is wider than it.
-func (m model) frame(title string, summary []string, left, right []string, hints []hint) string {
+func (m model) frame(summary []string, left, right []string, hints []hint) string {
 	w := m.cols()
-	head := " " + badgeStyle.Render(" "+title+" ")
+	head := ""
 	for _, part := range summary {
 		if lipgloss.Width(head)+2+lipgloss.Width(part) > w-1 {
 			break
 		}
 		head += "  " + part
 	}
+	head = strings.TrimPrefix(head, " ")
 	out := []string{head, ""}
 	for i := range m.bodyRows() {
 		line := " " + at(left, i)
@@ -259,9 +260,9 @@ func (m model) View() string {
 		panel = []string{}
 	}
 	if !m.wide() && panel != nil {
-		return m.frame("Machines", m.summary(), panel, nil, m.hints())
+		return m.frame(m.summary(), panel, nil, m.hints())
 	}
-	return m.frame("Machines", m.summary(), m.listLines(), panel, m.hints())
+	return m.frame(m.summary(), m.listLines(), panel, m.hints())
 }
 
 // summary counts the connections by state, each count in its state's colour.
@@ -585,7 +586,7 @@ func (m promptModel) View() string {
 		summary = []string{count(amberStyle, "◆", fmt.Sprint(n), "questions waiting")}
 	}
 	m.status = ""
-	return m.frame("SSH input", summary, body, nil, m.hints())
+	return m.frame(summary, body, nil, m.hints())
 }
 
 func (m promptModel) hints() []hint {

@@ -366,8 +366,8 @@ failed `✕` red, and for the panel's last job succeeded `✓` green and cancell
 dark and one for light terminal backgrounds, each readable on its background;
 Lip Gloss picks the pair's variant from the terminal and degrades it on
 terminals with fewer colours. One violet accent marks focus and action: the
-title badge, the selected row's bar and tint, the focused form field, key caps,
-the selected button and the border of the add, edit and forget panels. The
+selected row's bar and tint, the focused form field, key caps, the selected
+button and the border of the add, edit and forget panels. The
 detail panel's border takes the selected connection's state colour, and a
 question's card is amber for a confirmation and pink for a password. Secondary
 text is grey; text without a role keeps the terminal's foreground. The selected
@@ -390,8 +390,8 @@ the answer: the header counts it and the hint line offers `ctrl+o`, and it opens
 once the form is saved or the form or the picker is left. Confirmations start on
 No; secrets are masked.
 
-Every screen is laid out the same way — a header with the title badge and the
-state counts, a blank row, the body, a status line, one hint line — and is
+Every screen is laid out the same way — a header with the state counts (Herdr
+sets the pane title into the popup border), a blank row, the body, a status line, one hint line — and is
 exactly the pane's size: the program does not use the alternate screen, so a
 taller frame would scroll its own top away. Panels are rounded boxes with their
 title set into the top edge, and a body under three rows drops the border.
