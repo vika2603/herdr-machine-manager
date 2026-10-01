@@ -20,10 +20,9 @@ herdr plugin link /path/to/this/checkout # or from a working tree
 
 Install builds the binary from source when a Go toolchain is present, and
 otherwise downloads the binary attached to the release that matches the
-manifest version, accepting it only if its SHA-256 matches
-[`scripts/checksums.txt`](scripts/checksums.txt) in the checkout. Release
-binaries are built by the `release` workflow for macOS and Linux on amd64 and
-arm64. `herdr plugin link` runs no build command; build the working tree
+manifest version, accepting it only if its SHA-256 matches the
+`checksums.txt` published with that release. Release binaries are built by the
+`release` workflow for macOS and Linux on amd64 and arm64. `herdr plugin link` runs no build command; build the working tree
 yourself with `just build`.
 
 Then bind a key in `~/.config/herdr/config.toml` and reload:
@@ -138,13 +137,17 @@ the way it is.
 
 ## Releases
 
+Set `version` in `herdr-plugin.toml`, commit, then push a matching tag:
+
 ```bash
-gh workflow run release.yml -f version=0.1.2
+git tag -a v0.3.1 -m "Machine Manager 0.3.1"
+git push origin v0.3.1
 ```
 
-The workflow builds the binary for every supported platform, writes the version
-into the manifest, commits the checksums `scripts/build.sh` verifies against,
-tags that commit and publishes the release.
+The `release` workflow refuses a tag that differs from the manifest version,
+then tests, builds the binary for every supported platform and publishes it
+with `checksums.txt`. Pushes to `main` and pull requests run the `ci` workflow
+(vet, race tests and lint).
 
 ## License
 

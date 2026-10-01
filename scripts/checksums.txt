@@ -1,4 +1,0 @@
-2bf3cb9c34d83aab854d15bb28cfbddac8485c04a8737412f94300151b8e0404  machine-manager-darwin-amd64
-bd6bf2809445be23b1236864a23ee5302e728d7c4f2ac4bebcb8349fe9b2de86  machine-manager-darwin-arm64
-fa905fe24b4b5f5c743d937f2c9e60fd21e1f0f1669c0b86a840ccea8953dd98  machine-manager-linux-amd64
-c04c9c2e7ffd4cf207fdc5fda8be19ee2557da28fe15545af9c9219dbacbf583  machine-manager-linux-arm64

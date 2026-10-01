@@ -4,7 +4,7 @@
 #
 # Building from source comes first: the result always matches the checkout.
 # The release asset is the fallback for a machine without a Go toolchain, and
-# is only used when its checksum matches the one recorded in this checkout.
+# is only used when its checksum matches the release's checksums.txt.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -33,13 +33,7 @@ x86_64 | amd64) arch=amd64 ;;
 esac
 
 asset="machine-manager-$os-$arch"
-url="https://github.com/vika2603/herdr-machine-manager/releases/download/v$version/$asset"
-
-expected=$(sed -n "s/^\([0-9a-f]\{64\}\)  $asset\$/\1/p" scripts/checksums.txt)
-if [ -z "$expected" ]; then
-	echo "build.sh: scripts/checksums.txt has no entry for $asset" >&2
-	exit 1
-fi
+release="https://github.com/vika2603/herdr-machine-manager/releases/download/v$version"
 
 if command -v curl >/dev/null 2>&1; then
 	fetch() { curl -fsSL -o "$1" "$2"; }
@@ -50,9 +44,21 @@ else
 	exit 1
 fi
 
-if ! fetch "$target.tmp" "$url"; then
+if ! fetch "$target.sums" "$release/checksums.txt"; then
+	rm -f "$target.sums"
+	echo "build.sh: could not download $release/checksums.txt" >&2
+	exit 1
+fi
+expected=$(sed -n "s/^\([0-9a-f]\{64\}\)  $asset\$/\1/p" "$target.sums")
+rm -f "$target.sums"
+if [ -z "$expected" ]; then
+	echo "build.sh: the release checksums have no entry for $asset" >&2
+	exit 1
+fi
+
+if ! fetch "$target.tmp" "$release/$asset"; then
 	rm -f "$target.tmp"
-	echo "build.sh: could not download $url" >&2
+	echo "build.sh: could not download $release/$asset" >&2
 	exit 1
 fi
 
