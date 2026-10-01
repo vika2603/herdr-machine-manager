@@ -23,19 +23,18 @@ type Alias struct {
 // each other terminate.
 const maxIncludeDepth = 16
 
-// DefaultPath returns the path of the per-user client configuration.
-func DefaultPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".ssh", "config"), nil
-}
-
 // Aliases parses path and every file it includes, returning the connectable
 // aliases in first-seen order.
 func Aliases(path string) ([]Alias, error) {
-	p := &parser{seen: make(map[string]struct{})}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "~/.ssh/config"
+	}
+	path, err := expandTilde(path)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{seen: make(map[string]bool)}
 	if err := p.parseFile(path, 0); err != nil {
 		return nil, err
 	}
@@ -44,7 +43,7 @@ func Aliases(path string) ([]Alias, error) {
 
 type parser struct {
 	aliases []Alias
-	seen    map[string]struct{}
+	seen    map[string]bool
 }
 
 func (p *parser) parseFile(path string, depth int) error {
@@ -73,7 +72,10 @@ func (p *parser) parseFile(path string, depth int) error {
 		case "host":
 			inMatch = false
 			for _, pattern := range splitArgs(rest) {
-				p.add(pattern, abs)
+				if pattern != "" && !strings.ContainsAny(pattern, "*?!") && !p.seen[pattern] {
+					p.seen[pattern] = true
+					p.aliases = append(p.aliases, Alias{Name: pattern, Source: abs})
+				}
 			}
 		case "match":
 			inMatch = true
@@ -89,22 +91,14 @@ func (p *parser) parseFile(path string, depth int) error {
 	return scanner.Err()
 }
 
-func (p *parser) add(pattern, source string) {
-	if !connectable(pattern) {
-		return
-	}
-	if _, ok := p.seen[pattern]; ok {
-		return
-	}
-	p.seen[pattern] = struct{}{}
-	p.aliases = append(p.aliases, Alias{Name: pattern, Source: source})
-}
-
 func (p *parser) include(arg, dir string, depth int) {
 	if depth >= maxIncludeDepth {
 		return
 	}
-	pattern := expandTilde(arg)
+	pattern, err := expandTilde(arg)
+	if err != nil {
+		return
+	}
 	if !filepath.IsAbs(pattern) {
 		pattern = filepath.Join(dir, pattern)
 	}
@@ -118,12 +112,6 @@ func (p *parser) include(arg, dir string, depth int) {
 		// nothing.
 		_ = p.parseFile(match, depth+1)
 	}
-}
-
-// connectable reports whether a Host pattern names a single host to connect
-// to. Wildcard and negated patterns only carry options for other hosts.
-func connectable(pattern string) bool {
-	return pattern != "" && !strings.ContainsAny(pattern, "*?!")
 }
 
 // splitKeyword separates the keyword from its arguments, accepting both
@@ -143,37 +131,33 @@ func splitArgs(s string) []string {
 		args   []string
 		cur    strings.Builder
 		quoted bool
-		begun  bool
 	)
 	for _, r := range s {
 		switch {
 		case r == '"':
 			quoted = !quoted
-			begun = true
 		case !quoted && (r == ' ' || r == '\t'):
-			if begun {
+			if cur.Len() > 0 {
 				args = append(args, cur.String())
 				cur.Reset()
-				begun = false
 			}
 		default:
 			cur.WriteRune(r)
-			begun = true
 		}
 	}
-	if begun {
+	if cur.Len() > 0 {
 		args = append(args, cur.String())
 	}
 	return args
 }
 
-func expandTilde(path string) string {
+func expandTilde(path string) (string, error) {
 	if path != "~" && !strings.HasPrefix(path, "~/") {
-		return path
+		return path, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return path
+		return "", err
 	}
-	return filepath.Join(home, strings.TrimPrefix(path, "~"))
+	return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
 }

@@ -89,7 +89,7 @@ process herdr starts is subject to a concurrent-command limit
 3. **Editing is a plain edit.** Label, target and session are fields of the
    stored connection. Saving a changed label on an active connection uses
    `machine rename`, the one cheap herdr command; a changed target or session
-   queues a disconnect followed by a connect.
+   queues one reconnect job that removes the old endpoint before connecting.
 4. **A machine added outside the plugin is adopted**, not ignored and never
    deleted: reconciliation imports anything herdr holds that the store does not
    know about.
@@ -136,16 +136,15 @@ have to resolve its own socket and state directories.
 
 - **Connection store and reconciliation.** The store is read at start and
   written on every change. herdr's list is read at start, after every job that
-  mutates it, and when `endpoints.json` changes — noticed by polling its
-  modification time every two seconds, which needs no watcher dependency and is
-  timely enough for an edit the plugin did not make. Reconciliation is
-  serialized: the job hook, the poll and an explicit refresh can fire at once,
+  mutates it, and every two seconds to discover changes made outside the plugin.
+  Polling the CLI avoids depending on where Herdr stores its endpoint file.
+  Reconciliation is serialized: the job hook, the poll and an explicit refresh can fire at once,
   and two of them would each decide a machine is unclaimed and adopt it twice.
-- **Job queue, ordered per connection.** Each submitted batch waits for the
-  previous batch of that connection to finish; different connections run in
-  parallel. A reconnect's disconnect and connect are accepted together or both
-  refused when the connection already has too many queued jobs. Completion
-  releases the batch's goroutine immediately, without an idle worker or timer.
+- **Job queue, ordered per connection.** Each job waits for its predecessor on
+  that connection; different connections run in parallel. Submission cannot
+  fail after a connection is saved. A reconnect is one connect job that removes
+  the old endpoint before adding the new one; a failed removal stops the job.
+  No queue capacity, batch admission, rollback, or idle worker is needed.
 - **PTY execution for `connect`.** The command runs under a PTY the daemon
   allocates, at a fixed 120×40, so `ssh` and herdr's own prompts behave as they
   do in a terminal. Output is kept as a bounded tail and broadcast line by line.
@@ -157,10 +156,11 @@ have to resolve its own socket and state directories.
   one falls back to a name in the temp directory derived from it.
 
 Single instance: the daemon holds a lock file beside the socket. A second
-instance of the same version exits. When an action or pane finds a different
-version, it leaves that daemon running while any job is unfinished. Once it is
-idle, the next open asks it to quit and takes over without restarting herdr. That
-request ends the older daemon's context rather than merely closing its listener:
+instance exits without replacing the socket. The ping version identifies the
+running executable's modification time, so rebuilding also changes its identity.
+When an action or pane finds a different build, it leaves that daemon running
+while any job is unfinished. Once idle, the next open asks it to quit and takes
+over without restarting herdr. That request ends the older daemon's context rather than merely closing its listener:
 a popup's open subscription would otherwise keep it serving, and its lock held,
 until the user closed that popup.
 
@@ -259,12 +259,13 @@ alias picker → form (label, target, remote session, install?)
     connection learns the endpoint id it was given
 ```
 
-**Prompt handling.** Explicitly disabled installation is declined. Other
-questions move the job to `awaiting_input`. When no UI is subscribed, the daemon
+**Prompt handling.** List connections require both the request and
+`install_remote` to allow installation; form saves use the form's explicit
+choice. Explicitly disabled installation is declined. Other questions move the job to `awaiting_input`. When no UI is subscribed, the daemon
 opens the separate `prompt` pane (64 by 13 cells), without the manager list or
 its footer. It handles questions from live events or the initial snapshot and
 closes when all have been answered or dismissed. An already-open manager shows
-the modal in place, respecting Herdr's single-popup limit.
+the question in its detail panel, respecting Herdr's single-popup limit.
 Confirmations offer No / Yes with No selected;
 passwords and passphrases use a masked input. Unknown questions use text input.
 The pending question is identified by job and prompt text, so background updates
@@ -288,8 +289,8 @@ The connection stays in the store either way — it is simply not active.
 ### 5.3 What is kept
 
 The queue holds every unfinished job plus the last finished one per connection:
-the error a failed row shows, and the output its detail view shows. Everything
-older is dropped as soon as a newer job replaces it. There is no history to
+the error a failed row shows, and the output its detail view shows. Each finished
+job replaces the previous finished job for its connection. There is no history to
 browse and no endpoint to read one from — `connections.list` carries that whole
 set, because it is small by construction.
 
@@ -317,11 +318,10 @@ aliases, so the file is parsed for `Host` lines:
 
 **Details — `ssh -G <alias>`.** The effective `hostname`, `user` and `port` come
 from `ssh -G`, which prints the fully resolved configuration, rather than from
-reimplementing OpenSSH's precedence rules. It runs for the aliases on screen,
-bounded in parallelism, and a failure degrades to showing the alias alone.
-
-The daemon owns this too — parsed on demand with an mtime check — so the picker
-opens against a cache rather than a filesystem walk.
+reimplementing OpenSSH's precedence rules. Resolution uses up to eight workers,
+and a failure degrades to showing the alias alone. Enumeration and resolution run on
+each aliases request; there is no mtime or TTL cache. Default paths and tilde
+expansion are handled by the alias parser.
 
 ## 7. The interface
 

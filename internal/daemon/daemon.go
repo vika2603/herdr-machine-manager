@@ -1,20 +1,15 @@
-// Package daemon is the resident half of the plugin. It owns the connection
-// store and the job queue, so a mutation outlives the popup that started it.
-//
-// The store is the source of truth. herdr holds only the connections that are
-// currently active, and the only herdr machine commands the plugin issues are
-// add and remove: disabling a connection removes it from herdr and keeps its
-// configuration here, which is also what makes an ssh target editable.
 package daemon
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vika2603/herdr-client/plugin"
@@ -27,17 +22,17 @@ import (
 	"github.com/vika2603/herdr-machine-manager/internal/store"
 )
 
-// Version is the build the daemon reports over ping. A TUI from a newer build
-// asks an older daemon to step aside, which is what makes a rebuild take
-// effect without restarting herdr.
-const Version = "0.5.0"
+// The executable timestamp distinguishes rebuilt development binaries too.
+var Version = func() string {
+	path, err := os.Executable()
+	if err == nil {
+		if info, err := os.Stat(path); err == nil {
+			return fmt.Sprint(info.ModTime().UnixNano())
+		}
+	}
+	return "0.5.0"
+}()
 
-// pollInterval is how often herdr's saved-machines file is checked for a
-// change made outside the plugin. Job-driven changes reload directly, so this
-// only has to be timely enough for an edit the plugin did not make.
-const pollInterval = 2 * time.Second
-
-// Daemon serves the plugin socket.
 type Daemon struct {
 	env   *plugin.Env
 	cli   machines.CLI
@@ -60,16 +55,11 @@ type Daemon struct {
 	cacheErr string
 	revision int
 
-	aliases   []sshconfig.Alias
-	aliasRead time.Time
-	aliasMod  time.Time
-
 	attentionMu      sync.Mutex
 	attentionPrompts map[string]string
 	attentionOpening bool
 }
 
-// ListResult is the reply to connections.list.
 type ListResult struct {
 	Connections []Connection `json:"connections"`
 	Jobs        []jobs.Job   `json:"jobs"`
@@ -77,24 +67,30 @@ type ListResult struct {
 	Error       string       `json:"error,omitempty"`
 }
 
-// AliasesResult is the reply to aliases.list.
 type AliasesResult struct {
 	Aliases []sshconfig.Alias `json:"aliases"`
 	Error   string            `json:"error,omitempty"`
 }
 
-// Run holds the instance lock, serves the socket and returns when ctx ends.
 func Run(ctx context.Context, env *plugin.Env) error {
-	lock, err := acquireLock(lockPath(env))
+	dir := stateDir(env)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "manager.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
-	defer lock.release()
+	defer func() { _ = lock.Close() }()
+	// Binding alone cannot serialize removal of a stale socket by two starters.
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	connections, err := store.Open(storePath(env))
+	connections, err := store.Open(filepath.Join(stateDir(env), "connections.json"))
 	if err != nil {
 		return err
 	}
@@ -120,14 +116,9 @@ func Run(ctx context.Context, env *plugin.Env) error {
 	return server.Serve(ctx)
 }
 
-// maxSocketPath is the practical limit on a unix socket path. The real limit
-// is the platform's sun_path (104 bytes on macOS, 108 on Linux); staying under
-// it keeps the daemon reachable from a deeply nested state directory.
+// Unix socket paths are limited to 104 bytes on macOS and 108 on Linux.
 const maxSocketPath = 100
 
-// socketPath is the daemon socket. It lives in the plugin state directory
-// unless that path is too long for a unix socket, in which case it falls back
-// to a name in the temp directory derived from that directory.
 func socketPath(env *plugin.Env) string {
 	dir := stateDir(env)
 	path := filepath.Join(dir, "manager.sock")
@@ -138,12 +129,6 @@ func socketPath(env *plugin.Env) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("herdr-machine-manager-%x.sock", sum[:6]))
 }
 
-// lockPath is the single-instance lock beside the socket.
-func lockPath(env *plugin.Env) string { return filepath.Join(stateDir(env), "manager.lock") }
-
-// storePath is the connections file.
-func storePath(env *plugin.Env) string { return filepath.Join(stateDir(env), "connections.json") }
-
 func stateDir(env *plugin.Env) string {
 	if env.StateDir != "" {
 		return env.StateDir
@@ -151,89 +136,54 @@ func stateDir(env *plugin.Env) string {
 	return filepath.Join(os.TempDir(), "herdr-machine-manager")
 }
 
-// endpointsPath is herdr's saved-machines file. It sits beside the API socket,
-// which is the one path herdr hands the plugin, so it is derived from that
-// rather than from a guess at the configuration directory.
-func endpointsPath(env *plugin.Env) string {
-	if env.SocketPath == "" {
-		return ""
-	}
-	return filepath.Join(filepath.Dir(env.SocketPath), "endpoints.json")
-}
-
 func (d *Daemon) handle(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
 	case ipc.MethodPing:
 		return ipc.PingResult{PluginID: d.env.PluginID, Version: Version, PID: os.Getpid()}, nil
-
-	case ipc.MethodList:
+	case ipc.MethodList, ipc.MethodRefresh:
+		if method == ipc.MethodRefresh {
+			d.refresh(ctx)
+		}
 		return d.snapshot(), nil
-
-	case ipc.MethodRefresh:
-		d.refresh(ctx)
-		return d.snapshot(), nil
-
 	case ipc.MethodAliasesList:
-		return d.aliasList(ctx), nil
-
-	case ipc.MethodSave:
-		var p ipc.SaveParams
-		if err := decode(params, &p); err != nil {
-			return nil, err
+		aliases, err := sshconfig.Aliases(d.cfg.SSHConfig)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return AliasesResult{Error: err.Error()}, nil
 		}
-		return d.save(ctx, p)
-
-	case ipc.MethodConnect, ipc.MethodDisconnect, ipc.MethodForget:
-		var p ipc.ConnectionTarget
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		return d.act(ctx, method, p)
-
-	case ipc.MethodJobInput:
-		var p ipc.InputParams
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		if err := d.queue.Input(p.JobID, p.Data); err != nil {
-			return nil, ipc.Errorf(ipc.CodeNotFound, "%v", err)
-		}
-		return map[string]string{"status": "ok"}, nil
-
-	case ipc.MethodJobCancel:
-		var p ipc.JobTarget
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		if err := d.queue.Cancel(p.JobID); err != nil {
-			return nil, ipc.Errorf(ipc.CodeNotFound, "%v", err)
-		}
-		return map[string]string{"status": "ok"}, nil
-
+		return AliasesResult{Aliases: sshconfig.Resolve(ctx, aliases)}, nil
 	case ipc.MethodShutdown:
-		// Answer first, then end Run: the caller is a newer build waiting for
-		// this daemon to release its lock.
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			d.stop()
-		}()
+		// Allow the reply to reach the upgrading client before closing subscriptions.
+		time.AfterFunc(100*time.Millisecond, d.stop)
 		return map[string]string{"status": "stopping"}, nil
+	case ipc.MethodSave, ipc.MethodConnect, ipc.MethodDisconnect, ipc.MethodForget, ipc.MethodJobInput, ipc.MethodJobCancel:
+	default:
+		return nil, ipc.Errorf(ipc.CodeUnknownMethod, "unknown method %q", method)
 	}
-	return nil, ipc.Errorf(ipc.CodeUnknownMethod, "unknown method %q", method)
+	var p struct {
+		ipc.SaveParams
+		ipc.InputParams
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, ipc.Errorf(ipc.CodeInvalidParams, "%v", err)
+	}
+	switch method {
+	case ipc.MethodSave:
+		return d.save(ctx, p.SaveParams)
+	case ipc.MethodConnect, ipc.MethodDisconnect, ipc.MethodForget:
+		return d.act(ctx, method, ipc.ConnectionTarget{ID: p.ID, Install: p.Install})
+	}
+	var err error
+	if method == ipc.MethodJobInput {
+		err = d.queue.Input(p.JobID, p.Data)
+	} else {
+		err = d.queue.Cancel(p.JobID)
+	}
+	if err != nil {
+		return nil, ipc.Errorf(ipc.CodeNotFound, "%v", err)
+	}
+	return map[string]string{"status": "ok"}, nil
 }
 
-func decode(raw json.RawMessage, out any) error {
-	if len(raw) == 0 {
-		return ipc.Errorf(ipc.CodeInvalidParams, "missing params")
-	}
-	if err := json.Unmarshal(raw, out); err != nil {
-		return ipc.Errorf(ipc.CodeInvalidParams, "%v", err)
-	}
-	return nil
-}
-
-// broadcast reaches every open subscription. The server is absent in tests
-// that exercise reconciliation on its own.
 func (d *Daemon) broadcast(event string, data any) {
 	if d.server != nil {
 		d.server.Broadcast(event, data)
@@ -251,10 +201,6 @@ func (d *Daemon) snapshot() ListResult {
 	}
 }
 
-// save writes a connection and queues whatever herdr needs to match it: a new
-// connection is connected, an active one whose target or session changed is
-// reconnected, and an active one whose label changed is renamed in place,
-// which is the one herdr command that costs nothing.
 func (d *Daemon) save(ctx context.Context, p ipc.SaveParams) (ipc.SaveResult, error) {
 	if p.Label == "" || p.Target == "" {
 		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInvalidParams, "a label and an ssh target are required")
@@ -270,36 +216,18 @@ func (d *Daemon) save(ctx context.Context, p ipc.SaveParams) (ipc.SaveResult, er
 		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "%v", err)
 	}
 
-	var queued []string
-	var queueErr error
+	var kind jobs.Kind
+	reconnect := previous.Target != saved.Target || previous.Session != saved.Session
 	switch {
 	case !existed:
-		queued, queueErr = d.enqueue(d.connectSpec(saved, p.Install))
+		kind = jobs.KindConnect
 	case saved.ProfileID == "":
-		// Not held by herdr: the store is all there is to update.
-	case previous.Target != saved.Target || previous.Session != saved.Session:
-		queued, queueErr = d.enqueue(d.disconnectSpec(saved), d.connectSpec(saved, p.Install))
+	case reconnect:
+		kind = jobs.KindConnect
 	case previous.Label != saved.Label:
-		queued, queueErr = d.enqueue(d.renameSpec(saved))
+		kind = jobs.KindRename
 	}
-
-	if queueErr != nil {
-		// No jobs from this save were accepted. Restore the old settings so
-		// retrying the form still queues the intended operation.
-		var rollbackErr error
-		if existed {
-			rollbackErr = d.store.Restore(previous)
-		} else {
-			rollbackErr = d.store.Delete(saved.ID)
-		}
-		d.refresh(ctx)
-		if rollbackErr != nil {
-			return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v; rollback failed: %v", queueErr, rollbackErr)
-		}
-		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v", queueErr)
-	}
-	d.refresh(ctx)
-	return ipc.SaveResult{ID: saved.ID, Jobs: queued}, nil
+	return d.submit(ctx, saved, kind, p.Install, existed && reconnect), nil
 }
 
 func (d *Daemon) act(ctx context.Context, method string, p ipc.ConnectionTarget) (ipc.SaveResult, error) {
@@ -307,91 +235,67 @@ func (d *Daemon) act(ctx context.Context, method string, p ipc.ConnectionTarget)
 	if !ok {
 		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeNotFound, "no connection %q", p.ID)
 	}
-	merged, _ := d.connection(p.ID)
-
-	var queued []string
-	var queueErr error
-	switch method {
-	case ipc.MethodConnect:
-		if merged.Active {
-			return ipc.SaveResult{ID: conn.ID}, nil
+	active := false
+	for _, merged := range d.snapshot().Connections {
+		if merged.ID == p.ID {
+			active = merged.Active
+			break
 		}
-		queued, queueErr = d.enqueue(d.connectSpec(conn, p.Install))
-
-	case ipc.MethodDisconnect:
-		if !merged.Active {
-			return ipc.SaveResult{ID: conn.ID}, nil
-		}
-		queued, queueErr = d.enqueue(d.disconnectSpec(conn))
-
-	case ipc.MethodForget:
-		queued, queueErr = d.enqueue(d.forgetSpec(conn))
 	}
+	var kind jobs.Kind
+	switch {
+	case method == ipc.MethodConnect && !active:
+		kind = jobs.KindConnect
+	case method == ipc.MethodDisconnect && active:
+		kind = jobs.KindDisconnect
+	case method == ipc.MethodForget:
+		kind = jobs.KindForget
+	}
+	return d.submit(ctx, conn, kind, p.Install && d.cfg.InstallRemote, false), nil
+}
 
+func (d *Daemon) submit(ctx context.Context, conn store.Connection, kind jobs.Kind, install, reconnect bool) ipc.SaveResult {
+	result := ipc.SaveResult{ID: conn.ID}
+	if kind != "" {
+		result.Jobs = []string{d.enqueue(conn, kind, install, reconnect)}
+	}
 	d.refresh(ctx)
-	if queueErr != nil {
-		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v", queueErr)
-	}
-	return ipc.SaveResult{ID: conn.ID, Jobs: queued}, nil
+	return result
 }
 
-func (d *Daemon) enqueue(specs ...jobs.Spec) ([]string, error) {
-	queued, err := d.queue.SubmitBatch(specs...)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]string, 0, len(queued))
-	for _, job := range queued {
-		ids = append(ids, job.ID)
-	}
-	return ids, nil
-}
-
-// refresh reloads herdr's list, reconciles it with the store and broadcasts
-// the result. Reconciliation is serialized: the job hook, the poller and an
-// explicit refresh can all fire at once, and two of them adopting the same
-// machine would store it twice.
 func (d *Daemon) refresh(ctx context.Context) {
 	d.reload.Lock()
 	defer d.reload.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	d.reloadOnce(ctx)
-
+	actual, err := d.cli.List(ctx)
+	var conns []Connection
+	if err == nil {
+		conns = d.reconcile(actual)
+	}
 	d.mu.Lock()
+	d.cacheErr = ""
+	if err != nil {
+		d.cacheErr = err.Error()
+	} else {
+		d.conns = conns
+	}
 	d.revision++
 	d.mu.Unlock()
 
 	d.broadcast(ipc.EventConnectionsChanged, d.snapshot())
 }
 
-// watchMachines notices a change made outside the plugin by polling the
-// modification time of herdr's saved-machines file.
+// Poll the CLI itself: external edits need not share the daemon's socket directory.
 func (d *Daemon) watchMachines(ctx context.Context) {
-	path := endpointsPath(d.env)
-	if path == "" {
-		return
-	}
-	var last time.Time
-	if info, err := os.Stat(path); err == nil {
-		last = info.ModTime()
-	}
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			info, err := os.Stat(path)
-			if err != nil {
-				continue
-			}
-			if info.ModTime().Equal(last) {
-				continue
-			}
-			last = info.ModTime()
 			d.refresh(ctx)
 		}
 	}

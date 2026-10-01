@@ -12,10 +12,15 @@ import (
 // requestAttention attempts to open a prompt once per waiting question. Jobs
 // arriving during pane startup are included in its initial subscribed snapshot.
 func (d *Daemon) requestAttention(job jobs.Job) {
-	if job.State != jobs.StateAwaitingInput || d.server == nil {
+	if d.server == nil {
 		return
 	}
 	d.attentionMu.Lock()
+	if job.State != jobs.StateAwaitingInput {
+		delete(d.attentionPrompts, job.ID)
+		d.attentionMu.Unlock()
+		return
+	}
 	if d.attentionPrompts == nil {
 		d.attentionPrompts = make(map[string]string)
 	}
@@ -47,22 +52,6 @@ func (d *Daemon) requestAttention(job jobs.Job) {
 		log.Printf("daemon: cannot open prompt for waiting job %s: %v", job.ID, err)
 		// An unavailable popup must remain discoverable even with routine job
 		// notifications disabled. One toast covers all jobs coalesced into this open.
-		ctx, cancelToast := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancelToast()
-		_, err = d.env.Client().NotificationShow(ctx, herdr.NotificationShowParams{
-			Title: "SSH machines: input needed",
-			Body:  herdr.Some("Open the manager to answer waiting jobs (" + err.Error() + ")"),
-		})
-		if err != nil {
-			log.Printf("daemon: cannot notify about waiting jobs: %v", err)
-		}
+		d.notify("SSH machines: input needed", "Open the manager to answer waiting jobs ("+err.Error()+")")
 	}()
-}
-
-// Clearing on departure from awaiting_input permits a later question with
-// identical wording, while updates to a dismissed question stay suppressed.
-func (d *Daemon) clearAttention(jobID string) {
-	d.attentionMu.Lock()
-	delete(d.attentionPrompts, jobID)
-	d.attentionMu.Unlock()
 }

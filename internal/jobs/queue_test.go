@@ -10,16 +10,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 	"unicode/utf8"
 )
 
-// script writes an executable shell script and returns the argv that runs it.
-// The PTY path is exercised against a real process rather than a stub runner:
-// the prompt handling only means anything against a terminal.
 func script(t *testing.T, body string) []string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cmd.sh")
@@ -29,456 +25,254 @@ func script(t *testing.T, body string) []string {
 	return []string{path}
 }
 
-// recorder collects what the queue reports.
-type recorder struct {
-	mu   sync.Mutex
-	jobs map[string]Job
-}
-
-func newRecorder() *recorder { return &recorder{jobs: map[string]Job{}} }
-
-func (r *recorder) hooks() Hooks {
-	return Hooks{OnUpdate: func(j Job) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.jobs[j.ID] = j
-	}}
-}
-
-func (r *recorder) state(id string) State {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.jobs[id].State
-}
-
-func (r *recorder) job(id string) Job {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.jobs[id]
-}
-
-// waitFor polls until cond holds, which is how a test observes a queue that
-// runs its jobs on their own goroutines.
-func waitFor(t *testing.T, what string, cond func() bool) {
+func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if cond() {
+		if condition() {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	t.Fatal("timed out waiting for job state")
 }
 
-func newTestQueue(t *testing.T) (*Queue, *recorder) {
+func testQueue(t *testing.T) *Queue {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	rec := newRecorder()
-	return NewQueue(ctx, rec.hooks()), rec
+	return NewQueue(ctx, Hooks{})
 }
 
-func TestRunJobSucceeds(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, err := q.Submit(Spec{Kind: KindDisconnect, Title: "disconnect one", ConnID: "c1",
-		Run: func(context.Context, Sink) error { return nil }})
-	if err != nil {
-		t.Fatal(err)
+func jobByID(q *Queue, id string) Job {
+	for _, job := range q.List() {
+		if job.ID == id {
+			return job
+		}
 	}
-	waitFor(t, "the job to succeed", func() bool { return rec.state(job.ID) == StateSucceeded })
+	return Job{}
 }
 
-func TestRunJobFailureKeepsTheError(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindRename, Title: "rename", ConnID: "c1",
-		Run: func(context.Context, Sink) error { return errors.New("herdr said no") }})
-
-	waitFor(t, "the job to fail", func() bool { return rec.state(job.ID) == StateFailed })
-	if got := q.List()[0].Err; got != "herdr said no" {
-		t.Errorf("error = %q, want the one the command reported", got)
-	}
+func awaitState(t *testing.T, q *Queue, id string, state State) Job {
+	t.Helper()
+	waitFor(t, func() bool { return jobByID(q, id).State == state })
+	return jobByID(q, id)
 }
 
-func TestNonZeroExitFails(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "echo nope\nexit 3\n")})
-
-	waitFor(t, "the job to fail", func() bool { return rec.state(job.ID) == StateFailed })
-	list := q.List()
-	if !strings.Contains(list[0].Err, "exit status 3") {
-		t.Errorf("error = %q, want it to name the exit status", list[0].Err)
+func TestCompletionAndRetention(t *testing.T) {
+	q := testQueue(t)
+	if err := q.Input("missing", "answer"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown input = %v", err)
 	}
-	if len(list[0].Tail) == 0 || list[0].Tail[0] != "nope" {
-		t.Errorf("tail = %q, want the command output", list[0].Tail)
+	success := func(context.Context, Sink) error { return nil }
+	first := q.Submit("one", Spec{Run: success})
+	awaitState(t, q, first.ID, StateSucceeded)
+	second := q.Submit("one", Spec{Run: func(context.Context, Sink) error { return errors.New("herdr said no") }})
+	got := awaitState(t, q, second.ID, StateFailed)
+	if got.Err != "herdr said no" || len(q.List()) != 1 || q.List()[0].ID != second.ID {
+		t.Errorf("retained jobs = %+v", q.List())
 	}
-}
-
-func TestKnownPromptIsAnswered(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{
-		Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args:    script(t, "printf 'install the remote herdr binary? [y/N] '\nread a\necho \"answered:$a\"\n"),
-		Answers: []Answer{{Match: regexp.MustCompile(`install the remote herdr binary\?`), Reply: "y\n"}},
-	})
-
-	waitFor(t, "the job to succeed", func() bool { return rec.state(job.ID) == StateSucceeded })
-	tail := strings.Join(q.List()[0].Tail, "\n")
-	if !strings.Contains(tail, "answered:y") {
-		t.Errorf("tail = %q, want the configured answer to have been sent", tail)
+	third := q.Submit("two", Spec{Run: success})
+	awaitState(t, q, third.ID, StateSucceeded)
+	if len(q.List()) != 2 {
+		t.Errorf("retained %d jobs, want one per connection", len(q.List()))
 	}
-	if rec.job(job.ID).Prompt != "" {
-		t.Error("a job answered from its spec should never have reported a prompt")
-	}
-	if !strings.Contains(tail, "install the remote herdr binary?") {
-		t.Errorf("tail = %q, want the question that was answered to be visible", tail)
+	if err := q.Input(third.ID, "answer"); !errors.Is(err, ErrNotWaiting) {
+		t.Errorf("finished input = %v", err)
 	}
 }
 
-func TestUnknownPromptWaitsForInput(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{
-		Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "printf 'passphrase: '\nread p\necho \"got:$p\"\n"),
-	})
-
-	waitFor(t, "the job to ask", func() bool { return rec.state(job.ID) == StateAwaitingInput })
-	if prompt := q.List()[0].Prompt; !strings.Contains(prompt, "passphrase") {
-		t.Errorf("prompt = %q, want the text the command stopped on", prompt)
-	}
-	if err := q.Input(job.ID, "hunter2\n"); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the job to succeed", func() bool { return rec.state(job.ID) == StateSucceeded })
-	if tail := strings.Join(q.List()[0].Tail, "\n"); !strings.Contains(tail, "got:hunter2") {
-		t.Errorf("tail = %q, want the answer to have reached the command", tail)
-	}
-}
-
-func TestInputForUnknownJob(t *testing.T) {
-	q, _ := newTestQueue(t)
-	if err := q.Input("job-404", "x"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Input = %v, want ErrNotFound", err)
-	}
-}
-
-func TestCancelStopsARunningJob(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "sleep 30\n")})
-
-	waitFor(t, "the job to start", func() bool { return rec.state(job.ID) == StateRunning })
-	if err := q.Cancel(job.ID); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the job to end as cancelled", func() bool { return rec.state(job.ID) == StateCancelled })
-}
-
-func TestJobsOfOneConnectionRunInOrder(t *testing.T) {
+func TestSubmissionOrderAndParallelConnections(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		q, rec := newTestQueue(t)
+		q := testQueue(t)
 		release := make(chan struct{})
-		var order []string
-		var mu sync.Mutex
-		record := func(name string, hold bool) Spec {
-			return Spec{ConnID: "c1", Run: func(context.Context, Sink) error {
-				mu.Lock()
-				order = append(order, name+" start")
-				mu.Unlock()
-				if hold {
+		unblock := sync.OnceFunc(func() { close(release) })
+		defer unblock()
+		started := make(chan string, 4)
+		run := func(name string, block bool) func(context.Context, Sink) error {
+			return func(context.Context, Sink) error {
+				started <- name
+				if block {
 					<-release
 				}
-				mu.Lock()
-				order = append(order, name+" end")
-				mu.Unlock()
 				return nil
-			}}
-		}
-		first, err := q.Submit(record("first", true))
-		if err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		reconnect, err := q.SubmitBatch(record("disconnect", false), record("connect", false))
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Both workers have run until blocked: the second batch must be waiting
-		// for the first, not executing its commands alongside it.
-		synctest.Wait()
-		if rec.state(first.ID) != StateRunning || rec.state(reconnect[0].ID) != StateQueued || rec.state(reconnect[1].ID) != StateQueued {
-			t.Errorf("jobs overlapped: %+v", q.List())
-		}
-		close(release)
-		synctest.Wait()
-		// A completed connection can accept another batch after its chain retires.
-		if _, err := q.Submit(record("last", false)); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		want := []string{"first start", "first end", "disconnect start", "disconnect end", "connect start", "connect end", "last start", "last end"}
-		if !slices.Equal(order, want) {
-			t.Errorf("command order = %v, want %v", order, want)
-		}
-	})
-}
-
-func TestReconnectBatchIsAllOrNothingWhenLaneIsNearlyFull(t *testing.T) {
-	q, rec := newTestQueue(t)
-	release := make(chan struct{})
-	blocker, err := q.Submit(Spec{ConnID: "c1", Kind: KindConnect, Title: "blocker",
-		Run: func(context.Context, Sink) error { <-release; return nil }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer close(release)
-	waitFor(t, "blocker to start", func() bool { return rec.state(blocker.ID) == StateRunning })
-	for range laneDepth - 1 {
-		if _, err := q.Submit(Spec{ConnID: "c1", Kind: KindRename, Title: "queued",
-			Run: func(context.Context, Sink) error { return nil }}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	before := len(q.List())
-	if _, err := q.SubmitBatch(
-		Spec{ConnID: "c1", Kind: KindDisconnect, Title: "disconnect"},
-		Spec{ConnID: "c1", Kind: KindConnect, Title: "connect"},
-	); err == nil {
-		t.Fatal("batch accepted without room for both jobs")
-	}
-	if got := len(q.List()); got != before {
-		t.Errorf("batch partially queued: %d jobs, want %d", got, before)
-	}
-}
-
-func TestJobsOfDifferentConnectionsRunInParallel(t *testing.T) {
-	q, rec := newTestQueue(t)
-	started := make(chan string, 2)
-	block := make(chan struct{})
-	hold := func(name string) func(context.Context, Sink) error {
-		return func(ctx context.Context, _ Sink) error {
-			started <- name
-			<-block
-			return nil
-		}
-	}
-	one, _ := q.Submit(Spec{Kind: KindConnect, Title: "one", ConnID: "c1", Run: hold("c1")})
-	two, _ := q.Submit(Spec{Kind: KindConnect, Title: "two", ConnID: "c2", Run: hold("c2")})
-
-	// Both must be running before either is released; a serialized queue would
-	// deadlock here instead.
-	seen := map[string]bool{}
-	for range 2 {
-		select {
-		case name := <-started:
-			seen[name] = true
-		case <-time.After(5 * time.Second):
-			t.Fatalf("only %v started; the two connections did not run in parallel", seen)
-		}
-	}
-	close(block)
-	waitFor(t, "both jobs to finish", func() bool {
-		return rec.state(one.ID).Terminal() && rec.state(two.ID).Terminal()
-	})
-}
-
-func TestOnlyTheLastFinishedJobPerConnectionIsKept(t *testing.T) {
-	q, rec := newTestQueue(t)
-	done := func(context.Context, Sink) error { return nil }
-
-	first, _ := q.Submit(Spec{Kind: KindConnect, Title: "first", ConnID: "c1", Run: done})
-	waitFor(t, "the first job", func() bool { return rec.state(first.ID).Terminal() })
-	second, _ := q.Submit(Spec{Kind: KindDisconnect, Title: "second", ConnID: "c1", Run: done})
-	waitFor(t, "the second job", func() bool { return rec.state(second.ID).Terminal() })
-	other, _ := q.Submit(Spec{Kind: KindConnect, Title: "other", ConnID: "c2", Run: done})
-	waitFor(t, "the other connection's job", func() bool { return rec.state(other.ID).Terminal() })
-
-	list := q.List()
-	if len(list) != 2 {
-		t.Fatalf("kept %d jobs, want one per connection: %+v", len(list), list)
-	}
-	kept := map[string]string{}
-	for _, job := range list {
-		kept[job.ConnID] = job.Title
-	}
-	if kept["c1"] != "second" || kept["c2"] != "other" {
-		t.Errorf("kept %v, want the latest of each connection", kept)
-	}
-}
-
-func TestOutputIsReportedAsItArrives(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var mu sync.Mutex
-	var lines []string
-	q := NewQueue(ctx, Hooks{OnOutput: func(_ string, out []string) {
-		mu.Lock()
-		lines = append(lines, out...)
-		mu.Unlock()
-	}})
-
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "echo first\necho second\n")})
-
-	waitFor(t, "the output", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(lines) >= 2
-	})
-	waitFor(t, "the job to finish", func() bool {
-		for _, j := range q.List() {
-			if j.ID == job.ID && j.State.Terminal() {
-				return true
 			}
 		}
-		return false
-	})
-	mu.Lock()
-	defer mu.Unlock()
-	if lines[0] != "first" || lines[1] != "second" {
-		t.Errorf("lines = %q, want them in order", lines)
-	}
-}
-
-func TestTailIsBounded(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "i=0\nwhile [ $i -lt 400 ]; do echo line$i; i=$((i+1)); done\n")})
-
-	waitFor(t, "the job to finish", func() bool { return rec.state(job.ID).Terminal() })
-	if got := len(q.List()[0].Tail); got != tailLines {
-		t.Errorf("tail = %d lines, want it capped at %d", got, tailLines)
-	}
-}
-
-func TestQueuedJobIsCancelledBeforeItRuns(t *testing.T) {
-	q, rec := newTestQueue(t)
-	release := make(chan struct{})
-	blocker, _ := q.Submit(Spec{Kind: KindConnect, Title: "blocker", ConnID: "c1",
-		Run: func(context.Context, Sink) error { <-release; return nil }})
-	waitFor(t, "the first job to start", func() bool { return rec.state(blocker.ID) == StateRunning })
-
-	var ran atomic.Bool
-	queued, _ := q.Submit(Spec{Kind: KindConnect, Title: "queued", ConnID: "c1",
-		Run: func(context.Context, Sink) error { ran.Store(true); return nil }})
-	if err := q.Cancel(queued.ID); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-
-	waitFor(t, "both jobs to end", func() bool {
-		return rec.state(blocker.ID).Terminal() && rec.state(queued.ID).Terminal()
-	})
-	if got := rec.state(queued.ID); got != StateCancelled {
-		t.Errorf("state = %s, want %s", got, StateCancelled)
-	}
-	if ran.Load() {
-		t.Error("a cancelled job ran anyway")
-	}
-}
-
-func TestCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "stubborn", ConnID: "c1",
-		Args: script(t, "trap '' TERM\necho ready\nwhile :; do sleep 1; done\n")})
-
-	waitFor(t, "the command to install its signal handler", func() bool {
-		return strings.Contains(strings.Join(q.List()[0].Tail, "\n"), "ready")
-	})
-	if err := q.Cancel(job.ID); err != nil {
-		t.Fatal(err)
-	}
-	// SIGTERM is ignored, so only the SIGKILL after killGrace ends this job.
-	waitFor(t, "the job to end", func() bool { return rec.state(job.ID).Terminal() })
-}
-
-func TestOutputDoesNotClearAPendingPrompt(t *testing.T) {
-	q, rec := newTestQueue(t)
-	marker := filepath.Join(t.TempDir(), "start-progress")
-	// The command asks, then keeps printing progress dots on the same line
-	// while it waits. The job must stay in awaiting_input throughout.
-	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, fmt.Sprintf("printf 'passphrase: '\n(while [ ! -e %q ]; do sleep 0.01; done; i=0; while [ $i -lt 6 ]; do printf '.'; sleep 0.5; i=$((i+1)); done) &\nread p\necho \"got:$p\"\n", marker))})
-
-	waitFor(t, "the job to ask", func() bool { return rec.state(job.ID) == StateAwaitingInput })
-	if err := os.WriteFile(marker, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for range 6 {
-		time.Sleep(400 * time.Millisecond)
-		if got := rec.state(job.ID); got != StateAwaitingInput {
-			t.Fatalf("state = %s while the command was still waiting; output must not clear the prompt", got)
+		first := q.Submit("one", Spec{Run: run("first", true)})
+		synctest.Wait()
+		disconnect := q.Submit("one", Spec{Run: run("disconnect", false)})
+		connect := q.Submit("one", Spec{Run: run("connect", false)})
+		other := q.Submit("two", Spec{Run: run("other", false)})
+		synctest.Wait()
+		if jobByID(q, first.ID).State != StateRunning || jobByID(q, disconnect.ID).State != StateQueued || jobByID(q, connect.ID).State != StateQueued || jobByID(q, other.ID).State != StateSucceeded {
+			t.Errorf("connection scheduling = %+v", q.List())
 		}
-	}
-	if err := q.Input(job.ID, "secret\n"); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the job to finish", func() bool { return rec.state(job.ID).Terminal() })
+		unblock()
+		synctest.Wait()
+		close(started)
+		var order []string
+		for name := range started {
+			order = append(order, name)
+		}
+		if !slices.Equal(order, []string{"first", "other", "disconnect", "connect"}) {
+			t.Errorf("submission order = %v", order)
+		}
+	})
 }
 
-func TestLongUnterminatedOutputKeepsPromptBounded(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, err := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "i=0; while [ $i -lt 2000 ]; do printf '界'; i=$((i+1)); done\nprintf 'passphrase: '\nread p\necho done\n")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "the prompt after the long output", func() bool { return rec.state(job.ID) == StateAwaitingInput })
-	current := q.List()[0]
-	if !utf8.ValidString(current.Prompt) {
-		t.Errorf("prompt begins with broken UTF-8: %q", current.Prompt[:min(12, len(current.Prompt))])
-	}
-	if !strings.Contains(current.Prompt, "passphrase:") || len(current.Prompt) > maxPendingBytes {
-		t.Errorf("prompt length = %d, tail = %q; want a bounded prompt", len(current.Prompt), current.Prompt[max(0, len(current.Prompt)-60):])
-	}
-	if !strings.Contains(strings.Join(current.Tail, "\n"), "[long output line truncated]") {
-		t.Errorf("no truncation notice in output: %q", current.Tail)
-	}
-	if err := q.Input(job.ID, "secret\n"); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "job to finish", func() bool { return rec.state(job.ID).Terminal() })
-}
-
-func TestInputIsRefusedWhenNoPromptIsPending(t *testing.T) {
-	q, rec := newTestQueue(t)
-	job, _ := q.Submit(Spec{Kind: KindDisconnect, Title: "disconnect", ConnID: "c1",
-		Run: func(context.Context, Sink) error { return nil }})
-	waitFor(t, "the job to finish", func() bool { return rec.state(job.ID).Terminal() })
-
-	if err := q.Input(job.ID, "x"); !errors.Is(err, ErrNotWaiting) {
-		t.Errorf("Input on a finished job = %v, want ErrNotWaiting", err)
-	}
-}
-
-func TestConcurrentSubmitsKeepTheQueueConsistent(t *testing.T) {
-	q, _ := newTestQueue(t)
-	done := func(context.Context, Sink) error { return nil }
-
+func TestConcurrentSubmissionsSettlePerConnection(t *testing.T) {
+	q := testQueue(t)
 	var wg sync.WaitGroup
-	for conn := range 8 {
+	for conn := range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 25 {
-				_, _ = q.Submit(Spec{
-					Kind:   KindConnect,
-					Title:  "connect",
-					ConnID: fmt.Sprintf("c%d", conn),
-					Run:    done,
-				})
+			for range 20 {
+				q.Submit(string(rune('a'+conn)), Spec{Run: func(context.Context, Sink) error { return nil }})
 			}
 		}()
 	}
 	wg.Wait()
+	waitFor(t, func() bool {
+		jobs := q.List()
+		if len(jobs) != 4 {
+			return false
+		}
+		for _, job := range jobs {
+			if !job.State.Terminal() {
+				return false
+			}
+		}
+		return true
+	})
+}
 
-	// Every id the queue lists must still resolve, and the list must settle to
-	// one finished job per connection.
-	waitFor(t, "the queue to settle", func() bool { return len(q.List()) == 8 })
-	for _, job := range q.List() {
-		if job.ID == "" || job.ConnID == "" {
-			t.Fatalf("job %+v lost its identity", job)
+func TestQueuedCancellationSkipsRunner(t *testing.T) {
+	q := testQueue(t)
+	release := make(chan struct{})
+	first := q.Submit("one", Spec{Run: func(context.Context, Sink) error { <-release; return nil }})
+	awaitState(t, q, first.ID, StateRunning)
+	ran := false
+	second := q.Submit("one", Spec{Run: func(context.Context, Sink) error { ran = true; return nil }})
+	if err := q.Cancel(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	awaitState(t, q, second.ID, StateCancelled)
+	if ran {
+		t.Fatal("cancelled runner executed")
+	}
+}
+
+func TestPTYExitAndOutput(t *testing.T) {
+	q := testQueue(t)
+	var mu sync.Mutex
+	var output []string
+	q.hooks.OnOutput = func(_ string, lines []string) {
+		mu.Lock()
+		output = append(output, lines...)
+		mu.Unlock()
+	}
+	args := script(t, "echo first\necho second\nexit 3\n")
+	job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, nil, sink) }})
+	got := awaitState(t, q, job.ID, StateFailed)
+	if !strings.Contains(got.Err, "exit status 3") || !slices.Equal(got.Tail, []string{"first", "second"}) {
+		t.Errorf("failed PTY job = %+v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(output, got.Tail) {
+		t.Errorf("streamed output = %q, tail = %q", output, got.Tail)
+	}
+}
+
+func TestPTYPrompts(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, input, want string
+		answers                 []Answer
+	}{
+		{"automatic", "printf 'install the remote herdr binary? [y/N] '; read a; echo answered:$a", "", "answered:y",
+			[]Answer{{Match: regexp.MustCompile(`install the remote herdr binary\?`), Reply: "y\n"}}},
+		{"manual", "printf 'passphrase: '; read a; echo answered:$a", "secret\n", "answered:secret", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := testQueue(t)
+			args := script(t, tc.body)
+			job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, tc.answers, sink) }})
+			if tc.input != "" {
+				got := awaitState(t, q, job.ID, StateAwaitingInput)
+				if !strings.Contains(got.Prompt, "passphrase") {
+					t.Errorf("prompt = %q", got.Prompt)
+				}
+				if err := q.Input(job.ID, tc.input); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := awaitState(t, q, job.ID, StateSucceeded)
+			if !strings.Contains(strings.Join(got.Tail, "\n"), tc.want) {
+				t.Errorf("output = %q", got.Tail)
+			}
+		})
+	}
+}
+
+func TestPendingOutputIsBoundedOnRuneBoundary(t *testing.T) {
+	q := testQueue(t)
+	args := script(t, "i=0; while [ $i -lt 2000 ]; do printf '界'; i=$((i+1)); done; printf 'passphrase: '; read a; echo done")
+	job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, nil, sink) }})
+	got := awaitState(t, q, job.ID, StateAwaitingInput)
+	if len(got.Prompt) > maxPendingBytes || !utf8.ValidString(got.Prompt) || !strings.Contains(got.Prompt, "passphrase:") {
+		t.Errorf("prompt has invalid bounded tail: length %d, last bytes %q", len(got.Prompt), got.Prompt[max(0, len(got.Prompt)-30):])
+	}
+	if !strings.Contains(strings.Join(got.Tail, "\n"), "[long output line truncated]") {
+		t.Errorf("missing truncation notice: %q", got.Tail)
+	}
+	if err := q.Input(job.ID, "secret\n"); err != nil {
+		t.Fatal(err)
+	}
+	awaitState(t, q, job.ID, StateSucceeded)
+}
+
+func TestTailIsBounded(t *testing.T) {
+	q := testQueue(t)
+	args := script(t, "i=0; while [ $i -lt 400 ]; do echo line$i; i=$((i+1)); done")
+	job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, nil, sink) }})
+	got := awaitState(t, q, job.ID, StateSucceeded)
+	if len(got.Tail) != tailLines || got.Tail[0] != "line200" || got.Tail[tailLines-1] != "line399" {
+		t.Errorf("bounded tail = %q", got.Tail)
+	}
+}
+
+func TestProgressDoesNotDismissPrompt(t *testing.T) {
+	q := testQueue(t)
+	marker := filepath.Join(t.TempDir(), "start-progress")
+	args := script(t, fmt.Sprintf("printf 'passphrase: '; (while [ ! -e %q ]; do sleep 0.01; done; i=0; while [ $i -lt 20 ]; do printf '.'; sleep 0.05; i=$((i+1)); done) & read a; echo answered:$a", marker))
+	job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, nil, sink) }})
+	awaitState(t, q, job.ID, StateAwaitingInput)
+	// Start progress only after the question is visible, and inspect it before
+	// the idle detector could turn an incorrectly cleared prompt back on.
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 50 {
+		time.Sleep(20 * time.Millisecond)
+		if got := jobByID(q, job.ID).State; got != StateAwaitingInput {
+			t.Fatalf("state during progress = %s", got)
 		}
 	}
+	if err := q.Input(job.ID, "secret\n"); err != nil {
+		t.Fatal(err)
+	}
+	awaitState(t, q, job.ID, StateSucceeded)
+}
+
+func TestPTYCancellationEscalates(t *testing.T) {
+	q := testQueue(t)
+	args := script(t, "trap '' TERM; echo ready; while :; do sleep 1; done")
+	job := q.Submit("one", Spec{Run: func(ctx context.Context, sink Sink) error { return Exec(ctx, args, nil, sink) }})
+	waitFor(t, func() bool { return strings.Contains(strings.Join(jobByID(q, job.ID).Tail, "\n"), "ready") })
+	if err := q.Cancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	awaitState(t, q, job.ID, StateCancelled)
 }

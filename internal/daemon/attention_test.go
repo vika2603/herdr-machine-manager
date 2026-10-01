@@ -74,15 +74,12 @@ func TestPromptDuringPopupStartupIsIncludedInSnapshot(t *testing.T) {
 	server, path := attentionServer(t, d.handle)
 	d.server = server
 	submit := func(id string) jobs.Job {
-		job, err := d.queue.Submit(jobs.Spec{ConnID: id, Run: func(ctx context.Context, sink jobs.Sink) error {
+		queued := d.queue.Submit(id, jobs.Spec{Run: func(ctx context.Context, sink jobs.Sink) error {
 			sink.Prompt("Password:")
 			<-ctx.Done()
 			return ctx.Err()
 		}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return job
+		return queued
 	}
 	first := submit("first")
 	call := waitAttention(t, host, 0)
@@ -150,7 +147,7 @@ func TestAttentionFailureToastsOncePerQuestion(t *testing.T) {
 	if len(host.Calls()) != 2 {
 		t.Fatalf("repeated a failed attempt for the same prompt: %+v", host.Calls())
 	}
-	d.clearAttention(job.ID)
+	d.requestAttention(jobs.Job{ID: job.ID, State: jobs.StateRunning})
 	d.requestAttention(job)
 	waitAttention(t, host, 3)
 }

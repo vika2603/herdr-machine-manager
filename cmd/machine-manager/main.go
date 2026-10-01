@@ -1,6 +1,3 @@
-// Command machine-manager is the Herdr plugin that manages SSH machines.
-// One binary serves the resident daemon, the manager action and pane, and a
-// compact prompt pane. See docs/design.md.
 package main
 
 import (
@@ -21,15 +18,13 @@ func main() {
 	p := plugin.New()
 	p.Startup(daemon.Run)
 	p.Action("open", onOpen)
-	p.Pane("manager", onManager)
-	p.Pane("prompt", onPrompt)
+	p.Pane("manager", pane(ui.Run))
+	p.Pane("prompt", pane(ui.RunPrompt))
 	code := p.Run(ctx)
 	stop()
 	os.Exit(code)
 }
 
-// onOpen opens the manager popup. Placement and size come from the manifest,
-// so the call names only the plugin and the entrypoint.
 func onOpen(ctx context.Context, env *plugin.Env) error {
 	if err := daemon.Ensure(ctx, env); err != nil {
 		return err
@@ -52,21 +47,12 @@ func onOpen(ctx context.Context, env *plugin.Env) error {
 	return err
 }
 
-// onManager runs the TUI until the popup closes. A closed popup is a normal
-// exit, not a failed plugin command.
-func onManager(ctx context.Context, env *plugin.Env) error {
-	err := ui.Run(ctx, env)
-	if errors.Is(err, context.Canceled) {
-		return nil
+func pane(run func(context.Context, *plugin.Env) error) func(context.Context, *plugin.Env) error {
+	return func(ctx context.Context, env *plugin.Env) error {
+		err := run(ctx, env)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	}
-	return err
-}
-
-// onPrompt shows a compact input popup for a background job awaiting input.
-func onPrompt(ctx context.Context, env *plugin.Env) error {
-	err := ui.RunPrompt(ctx, env)
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
 }

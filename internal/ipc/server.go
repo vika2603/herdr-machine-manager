@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,7 +21,6 @@ type Handler func(ctx context.Context, method string, params json.RawMessage) (a
 // drops rather than blocking the daemon.
 const subscriberBuffer = 256
 
-// Server serves the daemon protocol on a unix socket.
 type Server struct {
 	ln      net.Listener
 	handler Handler
@@ -49,7 +49,6 @@ func Listen(path string, h Handler) (*Server, error) {
 	return &Server{ln: ln, handler: h, subs: map[chan wireEvent]struct{}{}}, nil
 }
 
-// Serve accepts connections until ctx ends or Close is called.
 func (s *Server) Serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { _ = s.ln.Close() })
 	defer stop()
@@ -71,12 +70,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// Close stops accepting and releases the socket.
 func (s *Server) Close() error { return s.ln.Close() }
 
-// Broadcast delivers an event to every open subscription. A full subscriber
-// buffer drops the event: events are advisory, and a client that misses one
-// re-reads the list.
 func (s *Server) Broadcast(name string, data any) {
 	ev := wireEvent{Event: name, Data: data}
 	s.mu.Lock()
@@ -89,8 +84,6 @@ func (s *Server) Broadcast(name string, data any) {
 	}
 }
 
-// HasSubscribers reports whether a plugin popup is currently listening for
-// job updates. Herdr allows only one popup at a time.
 func (s *Server) HasSubscribers() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -123,8 +116,6 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	_ = json.NewEncoder(conn).Encode(reply(req.ID, result, err))
 }
 
-// serveSubscription holds the connection open, writing events until the client
-// disconnects or the daemon stops.
 func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *bufio.Reader, id string) {
 	ch := make(chan wireEvent, subscriberBuffer)
 	s.mu.Lock()
@@ -140,15 +131,10 @@ func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *b
 		return
 	}
 
-	// A subscriber sends nothing more; reading detects the disconnect.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
-		for {
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				return
-			}
-		}
+		_, _ = io.Copy(io.Discard, reader)
 	}()
 
 	for {

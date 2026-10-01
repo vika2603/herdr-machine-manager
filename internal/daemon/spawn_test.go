@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/vika2603/herdr-client/plugin"
@@ -43,5 +44,24 @@ func TestEnsurePreservesOutdatedDaemonWithPendingJobs(t *testing.T) {
 				t.Fatalf("Ensure: %v", err)
 			}
 		})
+	}
+}
+
+func TestSpawnEnvironment(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_ACTION_ID", "open")
+	t.Setenv("HERDR_PLUGIN_ENTRYPOINT_ID", "manager")
+	t.Setenv("MM_TEST_INHERITED", "present")
+	env := &plugin.Env{PluginID: "test.manager", StateDir: t.TempDir(), BinPath: "/fake/herdr"}
+	vars := map[string]string{}
+	for _, item := range daemonEnv(env) {
+		key, value, _ := strings.Cut(item, "=")
+		vars[key] = value
+	}
+	loaded, err := plugin.LoadFrom(func(key string) (string, bool) { value, ok := vars[key]; return value, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Kind() != plugin.KindStartup || loaded.StateDir != env.StateDir || loaded.BinPath != env.BinPath || vars["MM_TEST_INHERITED"] != "present" {
+		t.Fatal("spawn lost explicit environment or inherited startup context")
 	}
 }
