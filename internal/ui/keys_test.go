@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -138,6 +139,19 @@ func TestPickerTypesIntoTheFilterAndPicksAnAlias(t *testing.T) {
 	m, _ = press(t, m, "esc")
 	if m.mode != modeList {
 		t.Errorf("esc from a new form: mode = %v, want the list", m.mode)
+	}
+}
+
+func TestPickerAddsTheTypedTargetWhenNoAliasMatches(t *testing.T) {
+	m := sized(sampleModel(), 100, 26)
+	m, _ = press(t, m, "a", "deploy@10.0.9.1")
+	// The typed text shows in the filter and in the note on what enter does.
+	if len(m.filtered()) != 0 || strings.Count(m.View(), "deploy@10.0.9.1") < 2 {
+		t.Fatalf("the picker does not say that enter adds the typed target:\n%s", m.View())
+	}
+	m, _ = press(t, m, "enter")
+	if m.mode != modeForm || m.editing != "" || m.fields[0].Value() != "deploy@10.0.9.1" || m.fields[1].Value() != "deploy@10.0.9.1" {
+		t.Errorf("enter: mode = %v, label = %q, target = %q; want a new form for the typed target", m.mode, m.fields[0].Value(), m.fields[1].Value())
 	}
 }
 

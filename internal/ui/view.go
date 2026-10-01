@@ -213,12 +213,8 @@ func (m model) hints() []hint {
 		return []hint{{"←→", "choose"}, {"enter", "send"}, {"esc", "later"}}
 	case m.dialog != nil:
 		return []hint{{"enter", "send"}, {"esc", "later"}}
-	case m.mode == modePick:
-		return []hint{{"enter", "choose"}, {"esc", "cancel"}}
-	case m.mode == modeForm && m.field == 3:
-		return []hint{{"enter", "save"}, {"tab", "next field"}, {"space", "switch"}, {"esc", "cancel"}}
-	case m.mode == modeForm:
-		return []hint{{"enter", "save"}, {"tab", "next field"}, {"esc", "cancel"}}
+	case m.typing():
+		return m.typingHints()
 	case m.mode == modeForget:
 		return []hint{{"enter", "forget"}, {"esc", "keep"}}
 	}
@@ -243,6 +239,25 @@ func (m model) hints() []hint {
 		hs = append(hs, hint{"space", map[bool]string{true: "disconnect", false: "connect"}[conn.Active]})
 	}
 	return append(hs, hint{"a", "add"}, hint{"e", "edit"}, hint{"d", "forget"}, hint{"r", "refresh"}, back)
+}
+
+// typingHints puts the waiting question right after the primary action, so a
+// narrow hint line keeps it.
+func (m model) typingHints() []hint {
+	hs := []hint{{"enter", "save"}}
+	if m.mode == modePick {
+		hs[0].action = map[bool]string{true: "choose", false: "add as typed"}[len(m.filtered()) > 0]
+	}
+	if len(m.waiting()) > 0 {
+		hs = append(hs, hint{"ctrl+o", "answer"})
+	}
+	if m.mode == modeForm {
+		hs = append(hs, hint{"tab", "next field"})
+	}
+	if m.mode == modeForm && m.field == 3 {
+		hs = append(hs, hint{"space", "switch"})
+	}
+	return append(hs, hint{"esc", "cancel"})
 }
 
 // listLines is one row per connection: the selection mark, the state glyph,
@@ -331,8 +346,10 @@ func (m model) pickLines(w, rows int) []string {
 		faintStyle.Render(fit("Filter", keyWidth)) + filter.View(),
 		"",
 	}
-	if len(list) == 0 {
-		return append(lines, faintStyle.Render("No alias in ~/.ssh/config matches."))
+	if typed := strings.TrimSpace(m.filter.Value()); len(list) == 0 && typed != "" {
+		return squeeze(append(lines, wrap("No alias in ~/.ssh/config matches. Press enter to add "+typed+" as the ssh target and label.", w)...), rows)
+	} else if len(list) == 0 {
+		return squeeze(append(lines, wrap("No alias in ~/.ssh/config. Press enter to type a target.", w)...), rows)
 	}
 	nameW := 0
 	for _, a := range list {

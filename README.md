@@ -67,7 +67,9 @@ the keys that apply right now; in a narrow popup it keeps the most important.
 | `esc` | Close the popup, or step back from details, a form or a question |
 
 In the alias picker, typing filters by alias or host, `↑` / `↓` move, `enter`
-picks. Aliases already added are marked. In the form, `tab` / `shift+tab` or
+picks. Aliases already added are marked. When no alias matches, `enter` starts
+the form with the typed text, such as `user@host`, as SSH target and label. In
+the form, `tab` / `shift+tab` or
 `↓` / `↑` move between fields, `space` toggles the install switch, `enter`
 saves. The form shows the `herdr machine add` command it will run and warns
 when saving disconnects and reconnects an active connection. The forget
@@ -82,7 +84,9 @@ and closes after the last answer or dismissal. Questions come one at a time. A
 confirmation starts on No and `←` / `→` choose; a password is masked. `esc` sets
 a question aside without answering or cancelling the job; it does not reopen by
 itself until a different question arrives, and `enter` on the connection opens
-it again.
+it again. A question that arrives while you type in the alias picker or the form
+waits: the header counts it, `ctrl+o` opens it, and it opens by itself once you
+save or leave the form.
 
 The install switch decides whether installing herdr on a remote that lacks it
 is allowed. When allowed, the installation still asks for confirmation; when

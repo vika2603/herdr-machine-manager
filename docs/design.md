@@ -357,8 +357,11 @@ the way out.
 or in the standalone prompt pane the daemon opens when no manager is
 subscribed. A question is identified by job and prompt text, so updates of the
 same job keep the draft, and a dismissed question stays dismissed until the user
-opens it or a different one arrives. Confirmations start on No; secrets are
-masked.
+opens it or a different one arrives. One that arrives while the user types in
+the alias picker or the form does not take focus, so keystrokes meant for the
+form never reach the answer: the header counts it and the hint line offers
+`ctrl+o`, and it opens once the form is saved or left. Confirmations start on
+No; secrets are masked.
 
 Every screen is laid out the same way — header with a summary, rule, body, rule
 carrying the status, one hint line — and is exactly the pane's size: the

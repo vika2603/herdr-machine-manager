@@ -91,6 +91,8 @@ func keys(s ...string) []tea.Msg {
 			out = append(out, tea.KeyMsg{Type: tea.KeyTab})
 		case "space":
 			out = append(out, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+		case "ctrl+o":
+			out = append(out, tea.KeyMsg{Type: tea.KeyCtrlO})
 		default:
 			out = append(out, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
 		}
@@ -144,11 +146,15 @@ func sampleScreens() []sampleScreen {
 		}),
 		manager("no connections", func(m model) model { m.conns, m.jobs = nil, nil; return m }),
 		manager("add: alias picker filtered by \"a\"", func(m model) model { return send(m, keys("a", "a")...) }),
+		manager("add: no alias matches the typed target", func(m model) model { return send(m, keys("a", "deploy@10.0.9.1")...) }),
 		manager("add: form for a picked alias", func(m model) model { return send(m, keys("a", "s", "a", "n", "enter")...) }),
 		manager("edit: active connection with a changed target", func(m model) model {
 			m = send(m, keys("e", "tab")...)
 			m.fields[1].SetValue("prod-new")
 			return m
+		}),
+		manager("edit: a question arrives while typing", func(m model) model {
+			return send(m, append(keys("e", "tab"), jobMsg(waitingJob("j2", "c2", "Enter the verification code:")))...)
 		}),
 		manager("forget confirmation, connected", func(m model) model { return send(m, keys("d")...) }),
 		manager("forget confirmation, not connected", func(m model) model { return send(m, keys("down", "d")...) }),

@@ -16,6 +16,11 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case m.dialog != nil:
 		return m.keyPrompt(msg)
+	case msg.String() == "ctrl+o" && m.typing():
+		if waiting := m.waiting(); len(waiting) > 0 {
+			m.openPrompt(waiting[0])
+		}
+		return m, nil
 	case m.mode == modePick:
 		return m.keyPick(msg)
 	case m.mode == modeForm:
@@ -78,6 +83,7 @@ func (m model) keyPick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key := msg.String(); key {
 	case "esc":
 		m.mode = m.back
+		m.syncPrompt()
 		return m, nil
 	case "up", "down", "pgup", "pgdown":
 		m.aliasCursor = navigate(key, m.aliasCursor, len(list), m.aliasRows())
@@ -86,6 +92,11 @@ func (m model) keyPick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(list) > 0 {
 			alias := list[clamp(m.aliasCursor, len(list))]
 			m.openForm("", alias.Name, alias.Name, "")
+		} else {
+			// A target missing from ~/.ssh/config, such as user@host, is typed
+			// into the filter.
+			typed := strings.TrimSpace(m.filter.Value())
+			m.openForm("", typed, typed, "")
 		}
 		return m, nil
 	}
@@ -122,6 +133,7 @@ func (m model) keyForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key := msg.String(); {
 	case key == "esc":
 		m.mode = m.back
+		m.syncPrompt()
 	case key == "tab" || key == "down":
 		m.focus(m.field + 1)
 	case key == "shift+tab" || key == "up":
@@ -131,6 +143,7 @@ func (m model) keyForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.failure = "a label and an ssh target are required"
 		} else {
 			m.mode = m.back
+			m.syncPrompt()
 			return m, m.request(ipc.MethodSave, p, "saved "+p.Label)
 		}
 	case m.field == 3:

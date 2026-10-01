@@ -38,7 +38,9 @@ func (m model) waiting() []jobs.Job {
 
 // syncPrompt follows the waiting questions: it closes a dialog whose question
 // is gone and opens the next question not dismissed. One dialog owns focus;
-// others wait their turn.
+// others wait their turn. While the user types in the picker or the form, the
+// next question waits until they leave it or open it with ctrl+o, so their
+// keystrokes do not land in the answer.
 func (m *model) syncPrompt() {
 	asked := map[string]bool{}
 	var next []jobs.Job
@@ -57,10 +59,12 @@ func (m *model) syncPrompt() {
 		return
 	}
 	m.dialog = nil
-	if len(next) > 0 {
+	if len(next) > 0 && !m.typing() {
 		m.openPrompt(next[0])
 	}
 }
+
+func (m model) typing() bool { return m.mode == modePick || m.mode == modeForm }
 
 func (m *model) openPrompt(job jobs.Job) {
 	input := textinput.New()

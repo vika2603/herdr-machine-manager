@@ -54,10 +54,11 @@ func TestSelectionStaysVisible(t *testing.T) {
 
 func TestEveryHintIsABinding(t *testing.T) {
 	keyFor := map[string][]tea.KeyMsg{
-		"enter": {{Type: tea.KeyEnter}},
-		"esc":   {{Type: tea.KeyEsc}},
-		"space": {{Type: tea.KeySpace, Runes: []rune{' '}}},
-		"tab":   {{Type: tea.KeyTab}},
+		"enter":  {{Type: tea.KeyEnter}},
+		"esc":    {{Type: tea.KeyEsc}},
+		"space":  {{Type: tea.KeySpace, Runes: []rune{' '}}},
+		"tab":    {{Type: tea.KeyTab}},
+		"ctrl+o": {{Type: tea.KeyCtrlO}},
 		// One of the two arrows changes the choice, whichever is made.
 		"←→": {{Type: tea.KeyRight}, {Type: tea.KeyLeft}},
 	}

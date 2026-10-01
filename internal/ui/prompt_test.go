@@ -27,12 +27,47 @@ func TestQuestionOpensInPlaceAndKeepsTheUnderlyingWork(t *testing.T) {
 		m, _ = press(t, m, setup...)
 		before := m
 		m, _ = promptUpdate(t, m, jobMsg(waitingJob("job-1", "c2", "Enter code:")))
+		if m.typing() {
+			m, _ = press(t, m, "ctrl+o")
+		}
 		if m.dialog == nil {
 			t.Fatalf("after %v: live question did not open", setup)
 		}
 		m, _ = press(t, m, "esc")
 		if m.mode != before.mode || m.cursor != before.cursor || m.field != before.field || m.filter.Value() != before.filter.Value() || m.forget != before.forget {
 			t.Errorf("after %v: dismissing the question changed the work underneath: mode %v→%v cursor %d→%d", setup, before.mode, m.mode, before.cursor, m.cursor)
+		}
+	}
+}
+
+func TestQuestionWaitsWhileTheUserTypes(t *testing.T) {
+	job := waitingJob("job-1", "c2", "Enter code:")
+	for _, c := range []struct {
+		setup, leave []string
+	}{
+		{[]string{"a", "n", "e"}, []string{"esc"}},
+		{[]string{"a", "n", "e"}, []string{"enter", "esc"}},
+		{[]string{"e", "x"}, []string{"esc"}},
+		{[]string{"e", "x"}, []string{"enter"}},
+	} {
+		m := sized(newModel(context.Background(), nil), 100, 26)
+		m, _ = promptUpdate(t, m, listMsg{Connections: []daemon.Connection{conn("c1", "One", "one", false), conn("c2", "Two", "two", false)}})
+		m, _ = press(t, m, c.setup...)
+		m, _ = promptUpdate(t, m, jobMsg(job))
+		if m.dialog != nil {
+			t.Fatalf("after %v: the question took focus from the input", c.setup)
+		}
+		if view := m.View(); !strings.Contains(view, "1 needs answer") || !strings.Contains(view, "ctrl+o answer") {
+			t.Errorf("after %v: the waiting question is not indicated:\n%s", c.setup, view)
+		}
+		typed := m.filter.Value() + m.fields[0].Value()
+		m, _ = press(t, m, "z")
+		if got := m.filter.Value() + m.fields[0].Value(); got != typed+"z" {
+			t.Errorf("after %v: typing gave %q, want %q", c.setup, got, typed+"z")
+		}
+		m, _ = press(t, m, c.leave...)
+		if m.typing() || m.dialog == nil || m.dialog.jobID != job.ID {
+			t.Errorf("after %v then %v: mode %v; want the question open once the input is left", c.setup, c.leave, m.mode)
 		}
 	}
 }
