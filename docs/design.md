@@ -141,11 +141,11 @@ have to resolve its own socket and state directories.
   timely enough for an edit the plugin did not make. Reconciliation is
   serialized: the job hook, the poll and an explicit refresh can fire at once,
   and two of them would each decide a machine is unclaimed and adopt it twice.
-- **Job queue, one lane per connection.** Jobs of the same connection run in
-  order — the disconnect and connect of a reconnect must not overlap — and
-  different connections run in parallel, because preparing two remote hosts has
-  no reason to be sequential. A lane retires after a minute of quiet, so a
-  daemon that outlives many connections does not accumulate goroutines.
+- **Job queue, ordered per connection.** Each submitted batch waits for the
+  previous batch of that connection to finish; different connections run in
+  parallel. A reconnect's disconnect and connect are accepted together or both
+  refused when the connection already has too many queued jobs. Completion
+  releases the batch's goroutine immediately, without an idle worker or timer.
 - **PTY execution for `connect`.** The command runs under a PTY the daemon
   allocates, at a fixed 120×40, so `ssh` and herdr's own prompts behave as they
   do in a terminal. Output is kept as a bounded tail and broadcast line by line.
@@ -157,8 +157,9 @@ have to resolve its own socket and state directories.
   one falls back to a name in the temp directory derived from it.
 
 Single instance: the daemon holds a lock file beside the socket. A second
-instance of the same version exits; a newer one asks the older to quit and takes
-over, which is what makes a rebuild take effect without restarting herdr. That
+instance of the same version exits. When an action or pane finds a different
+version, it leaves that daemon running while any job is unfinished. Once it is
+idle, the next open asks it to quit and takes over without restarting herdr. That
 request ends the older daemon's context rather than merely closing its listener:
 a popup's open subscription would otherwise keep it serving, and its lock held,
 until the user closed that popup.
@@ -176,9 +177,9 @@ request carrying `{id, method, params}`, a reply carrying `{id, result}` or
 `{id, error: {code, message}}`, and a subscription pushing `{event, data}`
 lines. Because it matches, the TUI talks to the daemon with herdr-client's own
 `herdr.Client` — `New(socket)`, `Call`, `OpenStream` — and `internal/ipc` holds
-only the server half, which herdr-client does not provide (`plugintest.Server`
-is a test double: it needs a `testing.TB`, replays scripted replies and does not
-serve subscriptions).
+only the server half. herdr-client's `plugintest.Server` supplies scripted
+replies and subscriptions for tests and requires a `testing.TB`; it is not a
+production server.
 
 | Method | Meaning |
 | --- | --- |
@@ -268,21 +269,18 @@ Confirmations offer No / Yes with No selected;
 passwords and passphrases use a masked input. Unknown questions use text input.
 The pending question is identified by job and prompt text, so background updates
 do not clear a draft and dismissed questions do not repeatedly take focus.
+One opening pane covers every job that starts waiting during its startup: it
+subscribes before loading the full job list. Opening is attempted once for each
+waiting question; a failure shows a toast directing the user to the manager,
+including when routine notifications are disabled.
 
 A prompt is the unterminated text output stopped on. It stops being a prompt
 when that line ends, not when any output arrives: a command that prints progress
 while it waits must not clear the input field the user is typing into.
 
-**Preflight** is designed but not implemented: `ssh -G <target>` to confirm the
-alias resolves, `ssh -o BatchMode=yes -o ConnectTimeout=5 <target> true` to
-learn whether the host authenticates without a prompt, and
-`ssh -o BatchMode=yes <target> 'command -v herdr'` to learn whether the remote
-already has herdr. The form controls whether installing is allowed; permitted
-installation still requires confirmation when the command asks.
-
 **Cancellation** signals the process group, and sends SIGKILL after a grace
 period: a command that ignores SIGTERM would otherwise hold its connection's
-lane for as long as herdr runs. `herdr machine add` saves nothing until the
+queue for as long as herdr runs. `herdr machine add` saves nothing until the
 remote is ready, so a cancelled or crashed job leaves no half-saved machine; it
 can leave a partially installed remote binary, which the next attempt reuses.
 The connection stays in the store either way — it is simply not active.
@@ -361,7 +359,7 @@ away.
 | `cmd/machine-manager` | entrypoint registration: startup, action, pane |
 | `internal/store` | the connections file, the source of truth |
 | `internal/daemon` | reconciliation, job specs, IPC server, single-instance lock |
-| `internal/jobs` | job model, queue with one lane per connection, PTY execution |
+| `internal/jobs` | job model, queue ordered per connection, PTY execution |
 | `internal/ipc` | the protocol's server half |
 | `internal/machines` | the `herdr machine` CLI wrapper |
 | `internal/sshconfig` | `~/.ssh/config` parsing and `ssh -G` resolution |
@@ -383,5 +381,3 @@ reconciliation with a fake `herdr`, `ui` over its state derivation.
   what decides whether disconnect/connect feels like a toggle or like a task.
 - **Whether a running herdr client reflects a machine change without a restart**,
   which decides whether the popup has to say so after a connect.
-- **`selected`**, the field herdr reports for the machine currently selected, is
-  read but not shown anywhere.

@@ -2,30 +2,30 @@ package daemon
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/vika2603/herdr-client/herdr"
-	"github.com/vika2603/herdr-client/plugin"
+	"github.com/vika2603/herdr-client/herdrtest"
+	"github.com/vika2603/herdr-client/plugin/plugintest"
 
-	"github.com/vika2603/herdr-machine-manager/internal/config"
 	"github.com/vika2603/herdr-machine-manager/internal/ipc"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 )
 
-func attentionServer(t *testing.T) (*ipc.Server, string) {
+func attentionServer(t *testing.T, handler ipc.Handler) (*ipc.Server, string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "manager-attention-")
+	dir, err := os.MkdirTemp("", "manager-attention-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "manager.sock")
-	server, err := ipc.Listen(path, nil)
+	server, err := ipc.Listen(path, handler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,10 +37,7 @@ func attentionServer(t *testing.T) (*ipc.Server, string) {
 			t.Errorf("serve: %v", err)
 		}
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
+	t.Cleanup(func() { cancel(); <-done })
 	return server, path
 }
 
@@ -48,142 +45,160 @@ func awaitPrompt(id string) jobs.Job {
 	return jobs.Job{ID: id, State: jobs.StateAwaitingInput, Prompt: "Password:"}
 }
 
-func waitAttention(t *testing.T, calls <-chan herdr.PluginPaneOpenParams) herdr.PluginPaneOpenParams {
+func waitAttention(t *testing.T, server *plugintest.Server, index int) herdrtest.Call {
 	t.Helper()
-	select {
-	case params := <-calls:
-		return params
-	case <-time.After(4 * time.Second):
-		t.Fatal("manager popup was not requested")
-		return herdr.PluginPaneOpenParams{}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	call, err := server.WaitCall(ctx, index)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return call
 }
 
-func TestRequestAttentionOpensOnceForClosedPopup(t *testing.T) {
-	server, _ := attentionServer(t)
-	calls := make(chan herdr.PluginPaneOpenParams, 2)
+func TestPromptDuringPopupStartupIsIncludedInSnapshot(t *testing.T) {
+	host := plugintest.NewServer(t)
 	release := make(chan struct{})
-	d := &Daemon{
-		env:    &plugin.Env{PluginID: "herdr.machine-manager"},
-		server: server,
-		cfg: config.Config{
-			PopupWidth: "70%", PopupHeight: "24",
-		},
-		attentionOpen: func(_ context.Context, p herdr.PluginPaneOpenParams) error {
-			calls <- p
-			<-release
-			return nil
-		},
+	defer close(release)
+	host.Handle(herdr.MethodPluginPaneOpen, func(ctx context.Context, _ herdrtest.Call) (herdr.Result, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return herdr.PluginPaneOpenedResponse{}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{env: host.Env()}
+	d.queue = jobs.NewQueue(ctx, jobs.Hooks{OnUpdate: d.requestAttention})
+	server, path := attentionServer(t, d.handle)
+	d.server = server
+	submit := func(id string) jobs.Job {
+		job, err := d.queue.Submit(jobs.Spec{ConnID: id, Run: func(ctx context.Context, sink jobs.Sink) error {
+			sink.Prompt("Password:")
+			<-ctx.Done()
+			return ctx.Err()
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job
 	}
-	job := awaitPrompt("job-1")
-	d.requestAttention(job)
-	p := waitAttention(t, calls)
-	if p.PluginID != d.env.PluginID || p.Entrypoint != "prompt" || !p.Focus.ValueOrZero() {
-		t.Errorf("popup params = %+v", p)
+	first := submit("first")
+	call := waitAttention(t, host, 0)
+	var params herdr.PluginPaneOpenParams
+	if err := json.Unmarshal(call.Params, &params); err != nil {
+		t.Fatal(err)
 	}
-	if p.Width.IsSet() || p.Height.IsSet() {
-		t.Errorf("prompt popup inherited manager size overrides: %+v", p)
+	if call.Method != herdr.MethodPluginPaneOpen || params.Entrypoint != "prompt" || !params.Focus.ValueOrZero() || params.Width.IsSet() || params.Height.IsSet() {
+		t.Fatalf("prompt popup request = %+v", call)
 	}
-	d.requestAttention(job)
-	close(release)
-	// The first call is in flight when the duplicate arrives. It must neither
-	// block the job hook nor issue another pane.open.
-	select {
-	case <-calls:
-		t.Fatal("same prompt opened another popup")
-	case <-time.After(50 * time.Millisecond):
+	second := submit("second")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		waiting := 0
+		for _, job := range d.queue.List() {
+			if job.State == jobs.StateAwaitingInput {
+				waiting++
+			}
+		}
+		if waiting == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second job did not reach its prompt")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Subscription precedes the snapshot, as it does in the prompt pane.
+	client := herdr.New(path)
+	stream, err := client.OpenStream(ctx, ipc.MethodSubscribe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	var snapshot ListResult
+	if err := client.Call(ctx, ipc.MethodList, nil, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Jobs) != 2 || snapshot.Jobs[0].ID != first.ID || snapshot.Jobs[1].ID != second.ID {
+		t.Fatalf("startup snapshot lost a waiting job: %+v", snapshot.Jobs)
+	}
+	d.requestAttention(awaitPrompt(first.ID))
+	d.requestAttention(awaitPrompt(second.ID))
+	if len(host.Calls()) != 1 {
+		t.Fatalf("opened more than one popup: %+v", host.Calls())
 	}
 }
 
-func TestRequestAttentionSkipsOpenPopupAndReopensAfterClose(t *testing.T) {
-	server, path := attentionServer(t)
+func TestAttentionFailureToastsOncePerQuestion(t *testing.T) {
+	host := plugintest.NewServer(t).
+		Fail(herdr.MethodPluginPaneOpen, "ui_busy", "another popup is open").
+		Reply(herdr.MethodNotificationShow, herdr.NotificationShowResponse{})
+	server, _ := attentionServer(t, nil)
+	d := &Daemon{env: host.Env(), server: server}
+	job := awaitPrompt("waiting")
+	d.requestAttention(job)
+	toast := waitAttention(t, host, 1)
+	if toast.Method != herdr.MethodNotificationShow || !strings.Contains(string(toast.Params), "Open the manager") {
+		t.Fatalf("missing fallback toast: %+v", toast)
+	}
+	d.requestAttention(job)
+	waitAttentionIdle(t, d)
+	d.requestAttention(job)
+	waitAttentionIdle(t, d)
+	if len(host.Calls()) != 2 {
+		t.Fatalf("repeated a failed attempt for the same prompt: %+v", host.Calls())
+	}
+	d.clearAttention(job.ID)
+	d.requestAttention(job)
+	waitAttention(t, host, 3)
+}
+
+func TestAttentionUsesExistingSubscription(t *testing.T) {
+	host := plugintest.NewServer(t).Reply(herdr.MethodPluginPaneOpen, herdr.PluginPaneOpenedResponse{})
+	server, path := attentionServer(t, nil)
+	d := &Daemon{env: host.Env(), server: server}
 	stream, err := herdr.New(path).OpenStream(context.Background(), ipc.MethodSubscribe, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = stream.Close() })
-	if !server.HasSubscribers() {
-		t.Fatal("manager subscription was not registered")
-	}
-	calls := make(chan herdr.PluginPaneOpenParams, 1)
-	d := &Daemon{
-		env:    &plugin.Env{PluginID: "herdr.machine-manager"},
-		server: server,
-		attentionOpen: func(_ context.Context, p herdr.PluginPaneOpenParams) error {
-			calls <- p
-			return nil
-		},
-	}
-	d.requestAttention(awaitPrompt("already-visible"))
-	if len(calls) != 0 {
+	defer func() { _ = stream.Close() }()
+	d.requestAttention(awaitPrompt("visible"))
+	waitAttentionIdle(t, d)
+	if len(host.Calls()) != 0 {
 		t.Fatal("opened another popup while one was subscribed")
 	}
-	if err := stream.Close(); err != nil {
-		t.Fatal(err)
+	_ = stream.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for server.HasSubscribers() {
+		if time.Now().After(deadline) {
+			t.Fatal("closed popup still appeared subscribed")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for server.HasSubscribers() && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	d.requestAttention(awaitPrompt("visible"))
+	waitAttentionIdle(t, d)
+	if len(host.Calls()) != 0 {
+		t.Fatal("reopened a dismissed question")
 	}
-	if server.HasSubscribers() {
-		t.Fatal("closed popup still appeared subscribed")
-	}
-	d.requestAttention(awaitPrompt("new-prompt"))
-	waitAttention(t, calls)
+	d.requestAttention(awaitPrompt("new"))
+	waitAttention(t, host, 0)
 }
 
-func TestRequestAttentionCanRetryFailedOpen(t *testing.T) {
-	server, _ := attentionServer(t)
-	calls := make(chan herdr.PluginPaneOpenParams, 2)
-	d := &Daemon{
-		env:    &plugin.Env{PluginID: "herdr.machine-manager"},
-		server: server,
-		attentionOpen: func(_ context.Context, p herdr.PluginPaneOpenParams) error {
-			calls <- p
-			return errors.New("Herdr unavailable")
-		},
-	}
-	job := awaitPrompt("failed-open")
-	d.requestAttention(job)
-	waitAttention(t, calls)
-	deadline := time.Now().Add(2 * time.Second)
+func waitAttentionIdle(t *testing.T, d *Daemon) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		d.attentionMu.Lock()
 		opening := d.attentionOpening
 		d.attentionMu.Unlock()
 		if !opening {
-			break
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("failed popup request did not finish")
+			t.Fatal("popup attempt did not finish")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	d.requestAttention(job)
-	waitAttention(t, calls)
-}
-
-func TestPromptDuringPopupStartupIsNotLost(t *testing.T) {
-	server, _ := attentionServer(t)
-	calls := make(chan herdr.PluginPaneOpenParams, 2)
-	release := make(chan struct{})
-	var count atomic.Int32
-	d := &Daemon{
-		env:    &plugin.Env{PluginID: "herdr.machine-manager"},
-		server: server,
-		attentionOpen: func(_ context.Context, p herdr.PluginPaneOpenParams) error {
-			calls <- p
-			if count.Add(1) == 1 {
-				<-release
-			}
-			return nil
-		},
-	}
-	d.requestAttention(awaitPrompt("first"))
-	waitAttention(t, calls)
-	d.requestAttention(awaitPrompt("second"))
-	close(release)
-	// If the first pane never subscribes, the second waiting job still needs
-	// an attention attempt once pane startup's grace period has passed.
-	waitAttention(t, calls)
 }

@@ -88,11 +88,11 @@ type Hooks struct {
 // state is the queue's own view of a job, with the parts the wire does not
 // carry.
 type state struct {
-	job       Job
-	spec      Spec
-	input     chan string
-	cancel    context.CancelFunc
-	cancelled bool
+	job    Job
+	spec   Spec
+	input  chan string
+	cancel context.CancelFunc
+	ctx    context.Context
 }
 
 // snapshot copies the job with its output, for a caller reading the list.

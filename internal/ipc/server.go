@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -52,10 +51,8 @@ func Listen(path string, h Handler) (*Server, error) {
 
 // Serve accepts connections until ctx ends or Close is called.
 func (s *Server) Serve(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
-		_ = s.ln.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = s.ln.Close() })
+	defer stop()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
@@ -100,22 +97,12 @@ func (s *Server) HasSubscribers() bool {
 	return len(s.subs) > 0
 }
 
-// subscribers reports how many subscriptions are open, for tests that check
-// they are released.
-func (s *Server) subscribers() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.subs)
-}
-
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -124,7 +111,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 	var req wireRequest
 	if err := json.Unmarshal(line, &req); err != nil {
-		_ = writeLine(conn, reply("", nil, Errorf(CodeInvalidParams, "malformed request: %v", err)))
+		_ = json.NewEncoder(conn).Encode(reply("", nil, Errorf(CodeInvalidParams, "malformed request: %v", err)))
 		return
 	}
 	if req.Method == MethodSubscribe {
@@ -133,7 +120,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 
 	result, err := s.handler(ctx, req.Method, req.Params)
-	_ = writeLine(conn, reply(req.ID, result, err))
+	_ = json.NewEncoder(conn).Encode(reply(req.ID, result, err))
 }
 
 // serveSubscription holds the connection open, writing events until the client
@@ -149,7 +136,7 @@ func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *b
 		s.mu.Unlock()
 	}()
 
-	if err := writeLine(conn, reply(id, map[string]string{"status": "subscribed"}, nil)); err != nil {
+	if err := json.NewEncoder(conn).Encode(reply(id, map[string]string{"status": "subscribed"}, nil)); err != nil {
 		return
 	}
 
@@ -171,7 +158,7 @@ func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *b
 		case <-closed:
 			return
 		case ev := <-ch:
-			if err := writeLine(conn, ev); err != nil {
+			if err := json.NewEncoder(conn).Encode(ev); err != nil {
 				return
 			}
 		}
@@ -187,13 +174,4 @@ func reply(id string, result any, err error) wireResponse {
 		return wireResponse{ID: id, Error: e}
 	}
 	return wireResponse{ID: id, Result: result}
-}
-
-func writeLine(w io.Writer, v any) error {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(raw, '\n'))
-	return err
 }

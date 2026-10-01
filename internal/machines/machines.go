@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,8 +19,6 @@ type Machine struct {
 	Label   string
 	Target  string
 	Session string
-	Enabled bool
-	Raw     json.RawMessage
 }
 
 // CLI runs the herdr machine subcommands.
@@ -102,13 +99,6 @@ func runError(args []string, err error, stdout, stderr []byte) error {
 	}
 	cmdline := "herdr " + strings.Join(args, " ")
 
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		if detail == "" {
-			return fmt.Errorf("%s: exit status %d", cmdline, exitErr.ExitCode())
-		}
-		return fmt.Errorf("%s: exit status %d: %s", cmdline, exitErr.ExitCode(), detail)
-	}
 	if detail == "" {
 		return fmt.Errorf("%s: %w", cmdline, err)
 	}
@@ -117,26 +107,19 @@ func runError(args []string, err error, stdout, stderr []byte) error {
 
 // decodeList reads the list leniently: the JSON key names of herdr's
 // SavedSshEndpoint are not part of a documented contract, so each field is
-// looked up under every name herdr is known to use, and the untouched record
-// is kept in Raw for later comparison.
+// looked up under every name herdr is known to use.
 func decodeList(data []byte) ([]Machine, error) {
-	var records []json.RawMessage
+	var records []map[string]any
 	if err := json.Unmarshal(data, &records); err != nil {
 		return nil, fmt.Errorf("decode machine list: %w", err)
 	}
 	list := make([]Machine, 0, len(records))
-	for i, record := range records {
-		var fields map[string]any
-		if err := json.Unmarshal(record, &fields); err != nil {
-			return nil, fmt.Errorf("decode machine %d: %w", i, err)
-		}
+	for _, fields := range records {
 		list = append(list, Machine{
 			ID:      pickString(fields, "id", "profile_id"),
 			Label:   pickString(fields, "label", "name"),
 			Target:  pickString(fields, "target", "ssh_target", "ssh_target_string"),
 			Session: pickString(fields, "session", "remote_session"),
-			Enabled: pickEnabled(fields),
-			Raw:     record,
 		})
 	}
 	return list, nil
@@ -149,13 +132,4 @@ func pickString(fields map[string]any, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-// pickEnabled defaults to true so a machine stays usable when herdr omits the
-// flag for enabled entries.
-func pickEnabled(fields map[string]any) bool {
-	if value, ok := fields["enabled"].(bool); ok {
-		return value
-	}
-	return true
 }

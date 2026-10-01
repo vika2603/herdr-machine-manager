@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 )
@@ -174,34 +176,52 @@ func TestCancelStopsARunningJob(t *testing.T) {
 }
 
 func TestJobsOfOneConnectionRunInOrder(t *testing.T) {
-	q, rec := newTestQueue(t)
-	var order []string
-	var mu sync.Mutex
-	record := func(name string) func(context.Context, Sink) error {
-		return func(context.Context, Sink) error {
-			mu.Lock()
-			order = append(order, name)
-			mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
-			return nil
+	synctest.Test(t, func(t *testing.T) {
+		q, rec := newTestQueue(t)
+		release := make(chan struct{})
+		var order []string
+		var mu sync.Mutex
+		record := func(name string, hold bool) Spec {
+			return Spec{ConnID: "c1", Run: func(context.Context, Sink) error {
+				mu.Lock()
+				order = append(order, name+" start")
+				mu.Unlock()
+				if hold {
+					<-release
+				}
+				mu.Lock()
+				order = append(order, name+" end")
+				mu.Unlock()
+				return nil
+			}}
 		}
-	}
-	queued, err := q.SubmitBatch(
-		Spec{Kind: KindDisconnect, Title: "disconnect", ConnID: "c1", Run: record("disconnect")},
-		Spec{Kind: KindConnect, Title: "connect", ConnID: "c1", Run: record("connect")},
-	)
-	if err != nil || len(queued) != 2 {
-		t.Fatalf("SubmitBatch = %+v, %v; want both jobs", queued, err)
-	}
-
-	waitFor(t, "both jobs to finish", func() bool {
-		return rec.state(queued[0].ID).Terminal() && rec.state(queued[1].ID).Terminal()
+		first, err := q.Submit(record("first", true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		reconnect, err := q.SubmitBatch(record("disconnect", false), record("connect", false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Both workers have run until blocked: the second batch must be waiting
+		// for the first, not executing its commands alongside it.
+		synctest.Wait()
+		if rec.state(first.ID) != StateRunning || rec.state(reconnect[0].ID) != StateQueued || rec.state(reconnect[1].ID) != StateQueued {
+			t.Errorf("jobs overlapped: %+v", q.List())
+		}
+		close(release)
+		synctest.Wait()
+		// A completed connection can accept another batch after its chain retires.
+		if _, err := q.Submit(record("last", false)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		want := []string{"first start", "first end", "disconnect start", "disconnect end", "connect start", "connect end", "last start", "last end"}
+		if !slices.Equal(order, want) {
+			t.Errorf("command order = %v, want %v", order, want)
+		}
 	})
-	mu.Lock()
-	defer mu.Unlock()
-	if len(order) != 2 || order[0] != "disconnect" || order[1] != "connect" {
-		t.Errorf("order = %v, want the reconnect pair in submission order", order)
-	}
 }
 
 func TestReconnectBatchIsAllOrNothingWhenLaneIsNearlyFull(t *testing.T) {
@@ -361,9 +381,11 @@ func TestQueuedJobIsCancelledBeforeItRuns(t *testing.T) {
 func TestCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
 	q, rec := newTestQueue(t)
 	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "stubborn", ConnID: "c1",
-		Args: script(t, "trap '' TERM\nwhile :; do sleep 1; done\n")})
+		Args: script(t, "trap '' TERM\necho ready\nwhile :; do sleep 1; done\n")})
 
-	waitFor(t, "the job to start", func() bool { return rec.state(job.ID) == StateRunning })
+	waitFor(t, "the command to install its signal handler", func() bool {
+		return strings.Contains(strings.Join(q.List()[0].Tail, "\n"), "ready")
+	})
 	if err := q.Cancel(job.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -373,12 +395,16 @@ func TestCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
 
 func TestOutputDoesNotClearAPendingPrompt(t *testing.T) {
 	q, rec := newTestQueue(t)
+	marker := filepath.Join(t.TempDir(), "start-progress")
 	// The command asks, then keeps printing progress dots on the same line
 	// while it waits. The job must stay in awaiting_input throughout.
 	job, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "printf 'passphrase: '\n(i=0; while [ $i -lt 6 ]; do printf '.'; sleep 0.5; i=$((i+1)); done) &\nread p\necho \"got:$p\"\n")})
+		Args: script(t, fmt.Sprintf("printf 'passphrase: '\n(while [ ! -e %q ]; do sleep 0.01; done; i=0; while [ $i -lt 6 ]; do printf '.'; sleep 0.5; i=$((i+1)); done) &\nread p\necho \"got:$p\"\n", marker))})
 
 	waitFor(t, "the job to ask", func() bool { return rec.state(job.ID) == StateAwaitingInput })
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for range 6 {
 		time.Sleep(400 * time.Millisecond)
 		if got := rec.state(job.ID); got != StateAwaitingInput {

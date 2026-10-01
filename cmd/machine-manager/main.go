@@ -16,32 +16,16 @@ import (
 	"github.com/vika2603/herdr-machine-manager/internal/ui"
 )
 
-// Entrypoint ids herdr-plugin.toml declares.
-const (
-	paneManager = "manager"
-	panePrompt  = "prompt"
-	actionOpen  = "open"
-)
-
 func main() {
 	ctx, stop := plugin.ShutdownContext(context.Background())
-	code := newPlugin().Run(ctx)
+	p := plugin.New()
+	p.Startup(daemon.Run)
+	p.Action("open", onOpen)
+	p.Pane("manager", onManager)
+	p.Pane("prompt", onPrompt)
+	code := p.Run(ctx)
 	stop()
 	os.Exit(code)
-}
-
-func newPlugin() *plugin.Plugin {
-	p := plugin.New()
-	p.Startup(onStartup)
-	p.Action(actionOpen, onOpen)
-	p.Pane(paneManager, onManager)
-	p.Pane(panePrompt, onPrompt)
-	return p
-}
-
-// onStartup runs the daemon for as long as Herdr is up.
-func onStartup(ctx context.Context, env *plugin.Env) error {
-	return daemon.Run(ctx, env)
 }
 
 // onOpen opens the manager popup. Placement and size come from the manifest,
@@ -52,7 +36,7 @@ func onOpen(ctx context.Context, env *plugin.Env) error {
 	}
 	params := herdr.PluginPaneOpenParams{
 		PluginID:   env.PluginID,
-		Entrypoint: paneManager,
+		Entrypoint: "manager",
 		Focus:      herdr.Some(true),
 	}
 	// A size in the user's config overrides the manifest's.

@@ -11,13 +11,12 @@ import (
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 )
 
-func TestEnsurePreservesCompatibleDaemonWithPendingJobs(t *testing.T) {
+func TestEnsurePreservesOutdatedDaemonWithPendingJobs(t *testing.T) {
 	for _, tc := range []struct {
 		version string
 		state   jobs.State
 	}{
-		{"0.3.0", jobs.StateQueued}, {"0.3.0", jobs.StateRunning}, {"0.3.0", jobs.StateAwaitingInput},
-		{"0.4.0", jobs.StateQueued}, {"0.4.0", jobs.StateRunning}, {"0.4.0", jobs.StateAwaitingInput},
+		{"0.1.0", jobs.StateQueued}, {"0.2.1", jobs.StateRunning}, {"unknown-build", jobs.StateAwaitingInput},
 	} {
 		t.Run(tc.version+"/"+string(tc.state), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())

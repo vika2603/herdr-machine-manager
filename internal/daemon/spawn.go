@@ -28,21 +28,18 @@ func Ensure(ctx context.Context, env *plugin.Env) error {
 		if pong.Version == Version {
 			return nil
 		}
-		// These versions use the same IPC schema. Let their PTY jobs finish before
-		// replacing it; the new UI can already answer their pending prompts.
-		if pong.Version == "0.3.0" || pong.Version == "0.4.0" {
-			var current ListResult
-			if err := client.Call(ctx, ipc.MethodList, nil, &current); err != nil {
-				return fmt.Errorf("daemon: cannot check pending jobs before upgrade: %w", err)
-			}
-			for _, job := range current.Jobs {
-				if !job.State.Terminal() {
-					return nil
-				}
+		// The wire format is stable. Leave any older daemon with unfinished
+		// jobs in place so upgrading cannot terminate an interactive PTY.
+		var current ListResult
+		if err := client.Call(ctx, ipc.MethodList, nil, &current); err != nil {
+			return fmt.Errorf("daemon: cannot check pending jobs before upgrade: %w", err)
+		}
+		for _, job := range current.Jobs {
+			if !job.State.Terminal() {
+				return nil
 			}
 		}
-		// A rebuilt binary replaces the running daemon rather than talking a
-		// protocol it no longer speaks.
+		// An idle daemon can hand over to the rebuilt binary.
 		_ = client.Call(ctx, ipc.MethodShutdown, nil, nil)
 		waitGone(ctx, client)
 	}

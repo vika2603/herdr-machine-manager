@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vika2603/herdr-client/herdr"
 	"github.com/vika2603/herdr-client/plugin"
 
 	"github.com/vika2603/herdr-machine-manager/internal/config"
@@ -65,13 +64,9 @@ type Daemon struct {
 	aliasRead time.Time
 	aliasMod  time.Time
 
-	attentionMu           sync.Mutex
-	attentionPrompts      map[string]string
-	attentionPending      map[string]jobs.Job
-	attentionOpening      bool
-	attentionOpeningUntil time.Time
-	attentionReplayActive bool
-	attentionOpen         func(context.Context, herdr.PluginPaneOpenParams) error
+	attentionMu      sync.Mutex
+	attentionPrompts map[string]string
+	attentionOpening bool
 }
 
 // ListResult is the reply to connections.list.

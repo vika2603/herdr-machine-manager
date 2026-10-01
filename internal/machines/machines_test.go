@@ -2,7 +2,6 @@ package machines
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,22 +79,13 @@ func TestListDecodesRecords(t *testing.T) {
 		t.Fatalf("got %d machines, want 2", len(list))
 	}
 
-	want := Machine{ID: "m1", Label: "build box", Target: "user@host", Session: "work", Enabled: true}
+	want := Machine{ID: "m1", Label: "build box", Target: "user@host", Session: "work"}
 	got := list[0]
-	got.Raw = nil
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("machine 0 = %+v, want %+v", got, want)
 	}
-	if list[1].Enabled {
-		t.Errorf("machine 1 Enabled = true, want false")
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(list[0].Raw, &raw); err != nil {
-		t.Fatalf("raw record is not valid JSON: %v", err)
-	}
-	if raw["id"] != "m1" {
-		t.Errorf("raw record id = %v, want m1", raw["id"])
+	if list[1].ID != "m2" || list[1].Target != "root@1.2.3.4" {
+		t.Errorf("machine 1 = %+v", list[1])
 	}
 }
 
@@ -108,32 +98,28 @@ func TestListAcceptsKeyAliases(t *testing.T) {
 		{
 			name:   "canonical keys",
 			record: `{"id":"a","label":"L","target":"t","session":"s","enabled":true}`,
-			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s", Enabled: true},
+			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s"},
 		},
 		{
 			name:   "profile id and name",
 			record: `{"profile_id":"a","name":"L","ssh_target":"t","remote_session":"s","enabled":true}`,
-			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s", Enabled: true},
+			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s"},
 		},
 		{
 			name:   "ssh target string",
 			record: `{"profile_id":"a","name":"L","ssh_target_string":"t","remote_session":"s","enabled":false}`,
-			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s", Enabled: false},
+			want:   Machine{ID: "a", Label: "L", Target: "t", Session: "s"},
 		},
-		{
-			name:   "missing enabled defaults to true",
-			record: `{"id":"a","label":"L","target":"t"}`,
-			want:   Machine{ID: "a", Label: "L", Target: "t", Enabled: true},
-		},
+
 		{
 			name:   "unknown keys are ignored",
 			record: `{"id":"a","mystery":{"nested":1},"enabled":true}`,
-			want:   Machine{ID: "a", Enabled: true},
+			want:   Machine{ID: "a"},
 		},
 		{
 			name:   "non-string value falls through to the next candidate",
 			record: `{"id":42,"profile_id":"a","label":"L","enabled":true}`,
-			want:   Machine{ID: "a", Label: "L", Enabled: true},
+			want:   Machine{ID: "a", Label: "L"},
 		},
 	}
 
@@ -144,7 +130,6 @@ func TestListAcceptsKeyAliases(t *testing.T) {
 				t.Fatalf("got %d machines, want 1", len(list))
 			}
 			got := list[0]
-			got.Raw = nil
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("machine = %+v, want %+v", got, tc.want)
 			}
