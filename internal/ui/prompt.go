@@ -1,23 +1,21 @@
 package ui
 
 import (
-	"strings"
-
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vika2603/herdr-machine-manager/internal/ipc"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 )
 
+// promptDialog is the question a waiting job asked. It is keyed by job and
+// prompt text, so a background update of the same job keeps the draft.
 type promptDialog struct {
-	jobID, prompt, title string
-	info                 jobs.PromptInfo
-	input                textinput.Model
-	yes, sending         bool
-	failure              string
+	jobID, prompt, connID string
+	info                  jobs.PromptInfo
+	input                 textinput.Model
+	yes, sending          bool
+	failure               string
 }
 
 type promptReplyMsg struct {
@@ -25,65 +23,65 @@ type promptReplyMsg struct {
 	err           error
 }
 
-func promptKey(id, prompt string) string { return id + "\x00" + prompt }
+func promptKey(jobID, prompt string) string { return jobID + "\x00" + prompt }
 
-// syncPrompt handles both live job events and the snapshot loaded after the
-// manager reopens. One dialog owns focus; additional questions wait their turn.
+// waiting is every question currently asked, in queue order.
+func (m model) waiting() []jobs.Job {
+	var out []jobs.Job
+	for _, j := range m.jobs {
+		if j.State == jobs.StateAwaitingInput {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// syncPrompt follows the waiting questions: it closes a dialog whose question
+// is gone and opens the next question not dismissed. One dialog owns focus;
+// others wait their turn.
 func (m *model) syncPrompt() {
-	waiting := make(map[string]bool)
-	for _, job := range m.active {
-		if job.State == jobs.StateAwaitingInput {
-			waiting[promptKey(job.ID, job.Prompt)] = true
+	asked := map[string]bool{}
+	var next []jobs.Job
+	for _, j := range m.waiting() {
+		asked[promptKey(j.ID, j.Prompt)] = true
+		if !m.dismissed[promptKey(j.ID, j.Prompt)] {
+			next = append(next, j)
 		}
 	}
-	for key := range m.dismissedPrompts {
-		if !waiting[key] {
-			delete(m.dismissedPrompts, key)
+	for key := range m.dismissed {
+		if !asked[key] {
+			delete(m.dismissed, key)
 		}
 	}
-	if m.dialog != nil && !waiting[promptKey(m.dialog.jobID, m.dialog.prompt)] {
-		m.dialog.input.SetValue("")
-		m.dialog = nil
-	}
-	if m.dialog != nil {
+	if m.dialog != nil && asked[promptKey(m.dialog.jobID, m.dialog.prompt)] {
 		return
 	}
-	for _, job := range m.active {
-		if job.State == jobs.StateAwaitingInput && !m.dismissedPrompts[promptKey(job.ID, job.Prompt)] {
-			m.openPrompt(job)
-			return
-		}
+	m.dialog = nil
+	if len(next) > 0 {
+		m.openPrompt(next[0])
 	}
 }
 
 func (m *model) openPrompt(job jobs.Job) {
 	input := textinput.New()
-	input.Prompt = "› "
+	input.Prompt = ""
 	input.Focus()
 	info := jobs.DescribePrompt(job.Prompt)
 	if info.Kind == jobs.PromptSecret {
 		input.EchoMode = textinput.EchoPassword
 	}
-	title := job.Title
-	for _, conn := range m.conns {
-		if conn.ID == job.ConnID {
-			title = conn.Label + " · " + conn.Target
-			break
-		}
-	}
-	m.dialog = &promptDialog{jobID: job.ID, prompt: job.Prompt, title: title, info: info, input: input}
+	m.dialog = &promptDialog{jobID: job.ID, prompt: job.Prompt, connID: job.ConnID, info: info, input: input}
 }
 
+// dismissPrompt sets the open question aside until the user opens it again or
+// a different question arrives, then moves on to the next one.
 func (m *model) dismissPrompt() {
-	if m.dialog == nil {
-		return
+	if m.dismissed == nil {
+		m.dismissed = map[string]bool{}
 	}
-	if m.dismissedPrompts == nil {
-		m.dismissedPrompts = make(map[string]bool)
-	}
-	m.dismissedPrompts[promptKey(m.dialog.jobID, m.dialog.prompt)] = true
-	m.dialog.input.SetValue("")
+	m.dismissed[promptKey(m.dialog.jobID, m.dialog.prompt)] = true
 	m.dialog = nil
+	m.syncPrompt()
 }
 
 func (m model) keyPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -94,13 +92,7 @@ func (m model) keyPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.dismissPrompt()
-		m.syncPrompt()
 		return m, nil
-	case "ctrl+x":
-		id := d.jobID
-		m.dismissPrompt()
-		m.syncPrompt()
-		return m, m.cancel(id)
 	case "enter":
 		answer := d.input.Value()
 		if d.info.Kind == jobs.PromptConfirm {
@@ -119,8 +111,10 @@ func (m model) keyPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if d.info.Kind == jobs.PromptConfirm {
 		switch msg.String() {
-		case "tab", "shift+tab", "left", "right", "up", "down", "ctrl+n", "ctrl+p", " ":
-			d.yes = !d.yes
+		case "left":
+			d.yes = false
+		case "right":
+			d.yes = true
 		}
 		return m, nil
 	}
@@ -129,85 +123,33 @@ func (m model) keyPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) viewPrompt(base string) string {
-	w := min(58, max(1, m.cols()-6))
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("4")).Padding(0, 1).Width(w + 2).Render(m.promptContent(w))
-	return overlayPrompt(base, box, m.cols(), m.height)
+// promptModel is the standalone prompt pane the daemon opens when no manager
+// is: it shows only the questions and closes after the last is answered or set
+// aside.
+type promptModel struct {
+	model
+	loaded bool
 }
 
-func (m model) promptContent(w int) string {
-	d := m.dialog
-	title := "Input required"
-	switch d.info.Kind {
-	case jobs.PromptConfirm:
-		title = "Confirmation required"
-	case jobs.PromptSecret:
-		title = "Password required"
-	}
-	wrap := lipgloss.NewStyle().Width(w).MaxWidth(w)
-	content := []string{titleStyle.Render(title), dimStyle.Render(ansi.Truncate(d.title, w, "…")), ""}
-	question := strings.Split(wrap.Render(ansi.Strip(d.prompt)), "\n")
-	// Long command output can precede a question. Keep its tail and reserve
-	// the controls even when the popup is short.
-	limit := 4
-	if m.height > 0 {
-		limit = max(1, m.height-11)
-	}
-	if len(question) > limit {
-		question = question[len(question)-limit:]
-	}
-	content = append(content, question...)
-	content = append(content, "")
-	if d.info.Kind == jobs.PromptConfirm {
-		no, yes := "  No  ", "  Yes  "
-		selected := lipgloss.NewStyle().Reverse(true).Bold(true)
-		if d.yes {
-			yes = selected.Render(yes)
-		} else {
-			no = selected.Render(no)
-		}
-		content = append(content, no+"   "+yes)
-	} else {
-		input := d.input
-		input.Width = max(1, w-2)
-		content = append(content, input.View())
-	}
-	hint := "Enter submit · Esc later"
-	if d.info.Kind == jobs.PromptConfirm {
-		hint = "Tab select · Enter confirm · Esc later"
-	}
-	if d.sending {
-		hint = "Sending…"
-	}
-	if d.failure != "" {
-		content = append(content, errStyle.Render(ansi.Truncate(d.failure, w, "…")))
-	}
-	content = append(content, "", dimStyle.Render(ansi.Truncate(hint, w, "")))
-	return strings.Join(content, "\n")
-}
+func (m promptModel) Init() tea.Cmd { return m.call(ipc.MethodList) }
 
-// Compose the modal onto the existing frame without replacing its screen or
-// changing its selection. ANSI-aware slicing keeps terminal columns aligned.
-func overlayPrompt(base, box string, width, height int) string {
-	background := strings.Split(base, "\n")
-	if height <= 0 {
-		height = max(len(background), lipgloss.Height(box))
-	}
-	for len(background) < height {
-		background = append(background, "")
-	}
-	background = background[:height]
-	foreground := strings.Split(box, "\n")
-	x := max(0, (width-lipgloss.Width(box))/2)
-	y := max(0, (height-len(foreground))/2)
-	for i, line := range foreground {
-		if y+i >= height {
-			break
+func (m promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok && m.dialog == nil {
+		if key.String() == "esc" || key.String() == "ctrl+c" {
+			return m, tea.Quit
 		}
-		under := background[y+i]
-		under += strings.Repeat(" ", max(0, width-lipgloss.Width(under)))
-		background[y+i] = ansi.Cut(under, 0, x) + line + ansi.Cut(under, x+lipgloss.Width(line), width)
-		background[y+i] = ansi.Truncate(background[y+i], width, "")
+		return m, nil
 	}
-	return strings.Join(background, "\n")
+	next, cmd := m.model.Update(msg)
+	m.model = next.(model)
+	if _, ok := msg.(listMsg); ok {
+		m.loaded = true
+	}
+	if m.loaded && m.dialog == nil {
+		if cmd != nil {
+			return m, tea.Sequence(cmd, tea.Quit)
+		}
+		return m, tea.Quit
+	}
+	return m, cmd
 }

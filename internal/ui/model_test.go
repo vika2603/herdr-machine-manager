@@ -1,164 +1,156 @@
 package ui
 
 import (
+	"context"
 	"strings"
 	"testing"
-
-	"github.com/charmbracelet/bubbles/textinput"
 
 	"github.com/vika2603/herdr-machine-manager/internal/daemon"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 	"github.com/vika2603/herdr-machine-manager/internal/sshconfig"
-	"github.com/vika2603/herdr-machine-manager/internal/store"
 )
 
-func conn(id, label, target string, active bool) daemon.Connection {
-	return daemon.Connection{
-		Connection: store.Connection{ID: id, Label: label, Target: target},
-		Active:     active,
+func TestConnLookDerivesOneStatePerConnection(t *testing.T) {
+	m := sampleModel()
+	for id, want := range map[string]string{
+		"c1": "connected",
+		"c2": "disconnected",
+		"c3": "connecting…",
+		"c4": "connect queued",
+		"c5": "needs answer",
+		"c6": "connect failed",
+		"c8": "disconnecting…",
+	} {
+		c, _ := m.connByID(id)
+		if got, _ := m.connLook(c); got.word != want {
+			t.Errorf("%s: state = %q, want %q", id, got.word, want)
+		}
+	}
+	c, _ := m.connByID("c6")
+	if _, err := m.connLook(c); err == "" {
+		t.Error("a failed connection did not carry its error")
 	}
 }
 
-func TestActiveJobsKeepsOnlyTheUnfinished(t *testing.T) {
-	got := activeJobs([]jobs.Job{
-		{ID: "1", State: jobs.StateSucceeded},
-		{ID: "2", State: jobs.StateRunning},
-		{ID: "3", State: jobs.StateAwaitingInput},
-		{ID: "4", State: jobs.StateFailed},
+func TestConnLookPrefersTheJobInFlightOverAnOlderFailure(t *testing.T) {
+	m := model{outputs: map[string][]string{}}
+	m.mergeJobs([]jobs.Job{
+		{ID: "j1", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateFailed, Err: "boom"},
+		{ID: "j2", ConnID: "c1", Kind: jobs.KindDisconnect, State: jobs.StateRunning},
+		{ID: "j3", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateQueued},
 	})
-	if len(got) != 2 || got[0].ID != "2" || got[1].ID != "3" {
-		t.Errorf("activeJobs = %+v, want the running and waiting jobs", got)
+	l, err := m.connLook(conn("c1", "One", "one", true))
+	if l.word != "disconnecting…" || err != "" {
+		t.Errorf("state = %q, error = %q; want the running job, not the one queued after it or the failure", l.word, err)
 	}
 }
 
-func TestMergeJobReplacesAndDerivesActive(t *testing.T) {
+func TestMergeJobReplacesAndReportsTheOutcome(t *testing.T) {
 	m := model{outputs: map[string][]string{}}
-	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateRunning})
-	m.mergeJob(jobs.Job{ID: "job-2", ConnID: "c2", State: jobs.StateRunning})
-	if len(m.active) != 2 {
-		t.Fatalf("active = %d, want 2", len(m.active))
+	m.mergeJob(jobs.Job{ID: "j1", ConnID: "c1", State: jobs.StateRunning})
+	m.mergeJob(jobs.Job{ID: "j1", ConnID: "c1", State: jobs.StateSucceeded, Title: "connect one"})
+	if len(m.jobs) != 1 || m.status != "connect one finished" {
+		t.Errorf("jobs = %d, status = %q; want the job replaced and its outcome reported", len(m.jobs), m.status)
 	}
-
-	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateSucceeded, Title: "connect one"})
-	if len(m.allJobs) != 2 {
-		t.Errorf("allJobs = %d, want the job replaced rather than appended", len(m.allJobs))
-	}
-	if len(m.active) != 1 || m.active[0].ID != "job-2" {
-		t.Errorf("active = %+v, want only job-2", m.active)
-	}
-	if m.status != "connect one finished" {
-		t.Errorf("status = %q, want the finished job reported", m.status)
+	if _, busy := m.pendingJob("c1"); busy {
+		t.Error("a finished job still counts as pending")
 	}
 }
 
-func TestMergeJobReportsAFailure(t *testing.T) {
-	m := model{outputs: map[string][]string{}}
-	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateFailed, Title: "connect", Err: "exit status 2"})
-	if !strings.Contains(m.failure, "exit status 2") {
-		t.Errorf("failure = %q, want the error carried through", m.failure)
-	}
-}
-
-func TestMergeJobMasksASecretPrompt(t *testing.T) {
-	m := model{outputs: map[string][]string{}}
-	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateAwaitingInput, Prompt: "alice@host password:"})
-	if m.dialog == nil || m.dialog.input.EchoMode != textinput.EchoPassword {
-		t.Error("a password prompt must not echo what is typed")
-	}
-	m.mergeJob(jobs.Job{ID: "job-1", ConnID: "c1", State: jobs.StateAwaitingInput, Prompt: "continue? [y/N]"})
-	if m.dialog == nil || m.dialog.input.EchoMode != textinput.EchoNormal {
-		t.Error("an ordinary prompt should echo")
-	}
-}
-
-func TestMergeJobsSeedsOutputsFromTheDaemon(t *testing.T) {
-	m := model{outputs: map[string][]string{"job-1": {"stale"}}}
-	m.mergeJobs([]jobs.Job{{ID: "job-1", ConnID: "c1", State: jobs.StateRunning, Tail: []string{"one", "two"}}})
-
-	// After a reconnect the daemon's copy is the complete one.
-	if got := m.outputs["job-1"]; len(got) != 2 || got[0] != "one" {
+func TestListTailsReplaceBufferedOutputAndDroppedJobsAreForgotten(t *testing.T) {
+	m := model{outputs: map[string][]string{"j1": {"stale"}, "gone": {"x"}}}
+	m.mergeJobs([]jobs.Job{{ID: "j1", State: jobs.StateRunning, Tail: []string{"one", "two"}}})
+	if got := m.outputs["j1"]; len(got) != 2 || got[0] != "one" {
 		t.Errorf("outputs = %q, want the daemon's tail", got)
 	}
-}
-
-func TestForgetOutputsDropsUnknownJobs(t *testing.T) {
-	m := model{outputs: map[string][]string{"job-1": {"a"}, "gone": {"b"}}}
-	m.allJobs = []jobs.Job{{ID: "job-1"}}
-	m.forgetOutputs()
 	if _, ok := m.outputs["gone"]; ok {
 		t.Error("output of a job the daemon dropped was kept")
 	}
-	if _, ok := m.outputs["job-1"]; !ok {
-		t.Error("output of a live job was dropped")
+}
+
+func TestStreamedOutputIsBounded(t *testing.T) {
+	m := newModel(context.Background(), nil)
+	m.jobs = []jobs.Job{{ID: "j1", State: jobs.StateRunning}}
+	for range outputLimit + 5 {
+		m, _ = promptUpdate(t, m, outputMsg{jobID: "j1", lines: []string{"line"}})
+	}
+	if got := len(m.outputs["j1"]); got != outputLimit {
+		t.Errorf("buffered %d lines, want %d", got, outputLimit)
 	}
 }
 
-func TestJobForMatchesTheConnection(t *testing.T) {
-	m := model{active: []jobs.Job{{ID: "job-1", ConnID: "c1"}, {ID: "job-2", ConnID: "c2"}}}
-	if job, ok := m.jobFor("c2"); !ok || job.ID != "job-2" {
-		t.Errorf("jobFor(c2) = %+v, %v", job, ok)
+func TestSelectionFollowsTheConnectionAcrossListUpdates(t *testing.T) {
+	m := newModel(context.Background(), nil)
+	a, b, c := conn("a", "A", "a", false), conn("b", "B", "b", false), conn("c", "C", "c", false)
+	m, _ = promptUpdate(t, m, listMsg{Connections: []daemon.Connection{a, b}})
+	m.cursor = 1
+	m, _ = promptUpdate(t, m, listMsg{Connections: []daemon.Connection{c, a, b}})
+	if m.conns[m.cursor].ID != "b" {
+		t.Errorf("selection = %q after a connection was inserted above it, want b", m.conns[m.cursor].ID)
 	}
-	if _, ok := m.jobFor("c3"); ok {
-		t.Error("jobFor reported a job for a connection that has none")
+	m, _ = promptUpdate(t, m, listMsg{Connections: []daemon.Connection{a}})
+	if m.conns[m.cursor].ID != "a" {
+		t.Errorf("selection = %q after the selected connection was removed, want a valid row", m.conns[m.cursor].ID)
 	}
 }
 
-func TestLastJobForReturnsTheMostRecent(t *testing.T) {
-	m := model{allJobs: []jobs.Job{
-		{ID: "job-1", ConnID: "c1", Title: "old"},
-		{ID: "job-2", ConnID: "c2"},
-		{ID: "job-3", ConnID: "c1", Title: "new"},
-	}}
-	job, ok := m.lastJobFor("c1")
-	if !ok || job.Title != "new" {
-		t.Errorf("lastJobFor(c1) = %+v, want the newest", job)
+func TestReconnectNoticeClearsOnceTheListIsRead(t *testing.T) {
+	m := newModel(context.Background(), nil)
+	m.config = "config.toml: bad value"
+	m, _ = promptUpdate(t, m, failureMsg("job not queued"))
+	m, _ = promptUpdate(t, m, linkMsg("lost the daemon, reconnecting…"))
+	m, cmd := promptUpdate(t, m, reconnectMsg{})
+	if cmd == nil {
+		t.Fatal("a reopened stream did not read the list again")
+	}
+	m, _ = promptUpdate(t, m, listMsg{})
+	if m.link != "" {
+		t.Errorf("link = %q after the list was read", m.link)
+	}
+	if m.failure == "" || m.config == "" {
+		t.Errorf("failure = %q, config = %q; a list read must not hide a rejected request or the config error", m.failure, m.config)
+	}
+	m, _ = promptUpdate(t, m, statusMsg("connect queued"))
+	if m.failure != "" || m.config == "" || !strings.Contains(m.View(), "config.toml: bad value") {
+		t.Errorf("after an accepted request: failure = %q, config = %q", m.failure, m.config)
+	}
+}
+
+func TestDetailFollowsTheJobInFlightNotTheOneQueuedBehindIt(t *testing.T) {
+	m := sized(newModel(context.Background(), nil), 100, 26)
+	asking := waitingJob("j1", "c1", "Enter the one-time code:")
+	asking.Tail = []string{"LIVE OUTPUT LINE"}
+	m, _ = promptUpdate(t, m, listMsg{
+		Connections: []daemon.Connection{conn("c1", "One", "one", true)},
+		Jobs:        []jobs.Job{asking, {ID: "j2", ConnID: "c1", Kind: jobs.KindForget, State: jobs.StateQueued}},
+	})
+	m, _ = press(t, m, "esc")
+	view := m.View()
+	if !strings.Contains(view, "one-time code") || !strings.Contains(view, "LIVE OUTPUT LINE") {
+		t.Errorf("the panel lost the waiting job's question or output:\n%s", view)
 	}
 }
 
 func TestFilteredMatchesNameAndHost(t *testing.T) {
-	m := model{aliases: []sshconfig.Alias{
-		{Name: "deploy", Host: "203.0.113.10"},
-		{Name: "build", Host: "10.0.0.8"},
-	}, aliasFilter: textinput.New()}
-
-	m.aliasFilter.SetValue("dep")
-	if got := m.filtered(); len(got) != 1 || got[0].Name != "deploy" {
-		t.Errorf("filter by name = %+v", got)
-	}
-	m.aliasFilter.SetValue("10.0")
-	if got := m.filtered(); len(got) != 1 || got[0].Name != "build" {
-		t.Errorf("filter by host = %+v", got)
-	}
-	m.aliasFilter.SetValue("")
-	if got := m.filtered(); len(got) != 2 {
-		t.Errorf("empty filter = %+v, want everything", got)
-	}
-}
-
-func TestScrollKeepsTheCursorVisible(t *testing.T) {
-	tests := []struct {
-		offset, cursor, rows, want int
-	}{
-		{offset: 0, cursor: 0, rows: 5, want: 0},
-		{offset: 0, cursor: 4, rows: 5, want: 0},
-		{offset: 0, cursor: 5, rows: 5, want: 1},
-		{offset: 3, cursor: 2, rows: 5, want: 2},
-		{offset: 3, cursor: 9, rows: 5, want: 5},
-	}
-	for _, tt := range tests {
-		if got := scroll(tt.offset, tt.cursor, tt.rows); got != tt.want {
-			t.Errorf("scroll(%d, %d, %d) = %d, want %d", tt.offset, tt.cursor, tt.rows, got, tt.want)
+	m := newModel(context.Background(), nil)
+	m.aliases = []sshconfig.Alias{{Name: "deploy", Host: "203.0.113.10"}, {Name: "build", Host: "10.0.0.8"}}
+	for filter, want := range map[string]int{"dep": 1, "10.0": 1, "": 2, "zzz": 0} {
+		m.filter.SetValue(filter)
+		if got := len(m.filtered()); got != want {
+			t.Errorf("filter %q matched %d aliases, want %d", filter, got, want)
 		}
 	}
 }
 
-func TestCurrentFollowsTheCursor(t *testing.T) {
-	m := model{conns: []daemon.Connection{conn("c1", "One", "one", true), conn("c2", "Two", "two", false)}, cursor: 1}
-	if got, ok := m.current(); !ok || got.ID != "c2" {
-		t.Errorf("current = %+v, %v", got, ok)
-	}
-	m.cursor = 5
-	if _, ok := m.current(); ok {
-		t.Error("current returned a connection for an out-of-range cursor")
+func TestEndpointFormatting(t *testing.T) {
+	for _, tt := range []struct{ user, host, port, want string }{
+		{host: "10.0.0.1", want: "10.0.0.1"},
+		{user: "root", host: "10.0.0.1", port: "22", want: "root@10.0.0.1"},
+		{user: "root", host: "10.0.0.1", port: "2222", want: "root@10.0.0.1:2222"},
+		{user: "root", want: ""},
+	} {
+		if got := endpoint(tt.user, tt.host, tt.port); got != tt.want {
+			t.Errorf("endpoint(%q, %q, %q) = %q, want %q", tt.user, tt.host, tt.port, got, tt.want)
+		}
 	}
 }

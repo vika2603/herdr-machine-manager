@@ -203,8 +203,12 @@ misses some re-reads the list.
 
 A client, and nothing more. It renders from `connections.list`, applies events
 as they arrive, and submits requests. No `herdr machine` process is ever a child
-of the TUI, so no keystroke waits on one. If the daemon is unreachable it says
-so and retries, re-spawning it.
+of the TUI, so no keystroke waits on one. The subscription does not replay what
+it missed, so every time it opens, including after the daemon was replaced or
+restarted, the TUI reads the list again; while it is down the TUI says so and
+retries every second. The daemon is started, when missing, before the TUI
+opens; the TUI does not start one later, because a popup of an older build would
+otherwise replace a newer daemon.
 
 Bubble Tea drives it, without the alternate screen: herdr destroys the popup
 pane when it closes, so there is no scrollback to protect, and staying on the
@@ -327,32 +331,40 @@ opens against a cache rather than a filesystem walk.
 
 ## 7. The interface
 
-**List** — one row per stored connection: `●` when herdr holds it, `○` when only
-the plugin does, the label, the target and, when that target is an alias, the
-endpoint it resolves to. A connection with a job in flight shows that job
-instead — `connecting…`, `needs an answer` — and one whose last job failed shows
-the error until the next job replaces it. A new connection is written to the
-store before its job runs, so it appears immediately, as `connecting…`.
+**One screen, master and detail.** The connection list sits on the left; the
+panel on the right follows the selection and shows the connection's state, the
+error of a failed job or the question of a waiting one, its saved settings, the
+address its target resolves to through `ssh -G`, and the tail of its latest
+job's output. Adding, editing, forgetting and answering replace the panel, not
+the screen, so the list stays in view and the work underneath — a half-filled
+form, a filter — survives a question arriving. Below 76 columns there is room
+for one column only: the panel replaces the list, and `enter` opens it.
 
-**Alias picker** — filterable, with the resolved host beside each alias and a
-mark on the ones already added.
+**One state vocabulary.** A state is a glyph, an ANSI colour and a word, the
+same in the list, the panel and the prompt: connected `●` green, disconnected
+`○` faint, queued `◌` and running `◐` blue, needs answer `◆` magenta, failed
+`✕` red. Secondary text is faint rather than grey and yellow is not used, so
+the popup reads on dark and light themes alike.
 
-**Form** — the same screen adds and edits. It shows the `herdr machine add`
-command it will run, so it is not a black box over herdr's own CLI, and warns
-when a change to an active connection's target means reconnecting it.
+**One key per action**, letters a first-time user can guess (`a` add, `e` edit,
+`d` forget, `x` cancel, `r` refresh), `space` to connect or disconnect, `enter`
+to answer or open, `esc` to go back or close. Movement alone has several keys.
+The hint line lists exactly the keys that apply to the current selection and
+mode, most important first; a narrow popup drops hints from the end and keeps
+the way out.
 
-**Confirm** — for `forget`, saying whether the connection is also being removed
-from herdr, and that sessions already running on that host keep running.
+**Questions.** A waiting job's question opens in the panel of an open manager,
+or in the standalone prompt pane the daemon opens when no manager is
+subscribed. A question is identified by job and prompt text, so updates of the
+same job keep the draft, and a dismissed question stays dismissed until the user
+opens it or a different one arrives. Confirmations start on No; secrets are
+masked.
 
-**Details** — saved connection settings, resolved address when known, and the
-latest task state and output. Interactive questions appear in a centered modal
-above the current screen; dismissing it preserves the underlying selection or
-form. Enter on a waiting connection opens its question again.
-
-Every screen is laid out the same way — header, rule, body, status, rule, help —
-and the body is cut to the rows the popup actually has. The program does not use
-the alternate screen, so a frame taller than the pane would scroll its own top
-away.
+Every screen is laid out the same way — header with a summary, rule, body, rule
+carrying the status, one hint line — and is exactly the pane's size: the
+program does not use the alternate screen, so a taller frame would scroll its
+own top away. When rows run short, blank separators go first, then the output
+tail, then the lower settings; the selected row and the answer control stay.
 
 ## 8. Packages
 

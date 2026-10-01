@@ -1,261 +1,214 @@
 package ui
 
 import (
-	"context"
-	"fmt"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"github.com/vika2603/herdr-machine-manager/internal/daemon"
-	"github.com/vika2603/herdr-machine-manager/internal/sshconfig"
 )
 
-// pressKey inspects the model and the returned command without running the
-// command: actions would otherwise contact the daemon.
-func pressKey(t *testing.T, m model, key tea.KeyMsg) (model, tea.Cmd) {
+// press applies keys without running the commands they return: those would
+// call the daemon. It reports the command of the last key.
+func press(t *testing.T, m model, names ...string) (model, tea.Cmd) {
 	t.Helper()
-	updated, cmd := m.key(key)
-	got, ok := updated.(model)
-	if !ok {
-		t.Fatalf("key returned %T, want ui.model", updated)
+	var cmd tea.Cmd
+	for _, msg := range keys(names...) {
+		m, cmd = promptUpdate(t, m, msg)
 	}
-	return got, cmd
+	return m, cmd
 }
 
-func TestListNavigationUsesVisiblePageAndKeepsEndpointsInBounds(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.height = 10
-	for i := range 12 {
-		m.conns = append(m.conns, conn(fmt.Sprintf("c%d", i), fmt.Sprintf("Machine %d", i), "host", false))
+func isQuit(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
 	}
-	page := m.rows()
+	_, ok := cmd().(tea.QuitMsg)
+	return ok
+}
 
-	for _, step := range []struct {
-		key            tea.KeyType
-		cursor, offset int
-	}{
-		{tea.KeyPgDown, page, 1},
-		{tea.KeyPgDown, min(2*page, 11), min(page+1, 12-page)},
-		{tea.KeyPgDown, 11, 12 - page},
-		{tea.KeyEnd, 11, 12 - page},
-		{tea.KeyPgUp, 11 - page, 11 - page},
-		{tea.KeyHome, 0, 0},
-		{tea.KeyPgUp, 0, 0},
-		{tea.KeyUp, 0, 0},
-		{tea.KeyCtrlN, 1, 0},
-		{tea.KeyCtrlP, 0, 0},
-	} {
-		m, _ = pressKey(t, m, tea.KeyMsg{Type: step.key})
-		if m.cursor != step.cursor || m.offset != step.offset {
-			t.Errorf("after %s: cursor/offset = %d/%d, want %d/%d", tea.KeyMsg{Type: step.key}, m.cursor, m.offset, step.cursor, step.offset)
+func TestBrowseMovesWithArrowsAndJK(t *testing.T) {
+	m := sized(sampleModel(), 100, 26)
+	m, _ = press(t, m, "j", "j", "down")
+	if m.cursor != 3 {
+		t.Fatalf("cursor = %d after three moves down, want 3", m.cursor)
+	}
+	m, _ = press(t, m, "k")
+	m, _ = promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	if m.cursor != 1 {
+		t.Errorf("cursor = %d after two moves up, want 1", m.cursor)
+	}
+	m, _ = promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	m, _ = press(t, m, "j")
+	if m.cursor != len(m.conns)-1 {
+		t.Errorf("cursor = %d, want it to stop at the last connection", m.cursor)
+	}
+}
+
+func TestBrowseActionKeys(t *testing.T) {
+	base := sized(sampleModel(), 100, 26) // c1, active, last job finished
+
+	m, cmd := press(t, base, "a")
+	if m.mode != modePick || cmd == nil || !m.filter.Focused() {
+		t.Errorf("a: mode = %v, command = %v; want the alias picker loading aliases", m.mode, cmd != nil)
+	}
+	m, cmd = press(t, base, "e")
+	if m.mode != modeForm || m.editing != "c1" || m.fields[0].Value() != "prod-api" || m.fields[2].Value() != "main" || cmd != nil {
+		t.Errorf("e: mode = %v, editing = %q, label = %q; want the edit form filled in", m.mode, m.editing, m.fields[0].Value())
+	}
+	if _, cmd = press(t, base, "space"); cmd == nil {
+		t.Error("space did not request a disconnect")
+	}
+	if _, cmd = press(t, base, "r"); cmd == nil {
+		t.Error("r did not request a refresh")
+	}
+	if _, cmd = press(t, base, "x"); cmd != nil {
+		t.Error("x issued a cancel for a connection with nothing to cancel")
+	}
+	if _, cmd = press(t, base, "down", "down", "x"); cmd == nil {
+		t.Error("x did not cancel the running job")
+	}
+	if _, cmd = press(t, base, "down", "down", "space"); cmd != nil {
+		t.Error("space queued another job behind the one in flight")
+	}
+	if m, cmd = press(t, base, "enter"); m.mode != modeList || cmd != nil {
+		t.Errorf("enter in a wide pane: mode = %v; the panel is already shown", m.mode)
+	}
+	if _, cmd = press(t, base, "esc"); !isQuit(cmd) {
+		t.Error("esc did not close the popup")
+	}
+	if _, cmd = press(t, base, "q"); cmd != nil {
+		t.Error("q is not a binding and must do nothing")
+	}
+}
+
+func TestNarrowPaneOpensDetailsOnDemand(t *testing.T) {
+	m := sized(sampleModel(), 60, 14)
+	m, _ = press(t, m, "enter")
+	if m.mode != modeDetail {
+		t.Fatalf("enter: mode = %v, want details", m.mode)
+	}
+	m, _ = press(t, m, "j")
+	if m.mode != modeDetail || m.cursor != 1 {
+		t.Errorf("moving in details: mode = %v, cursor = %d; the panel follows the selection", m.mode, m.cursor)
+	}
+	m, _ = press(t, m, "e", "esc")
+	if m.mode != modeDetail {
+		t.Errorf("esc from the form: mode = %v, want back to details", m.mode)
+	}
+	m, cmd := press(t, m, "esc")
+	if m.mode != modeList || isQuit(cmd) {
+		t.Errorf("esc from details: mode = %v; want the list, not closing", m.mode)
+	}
+	m = sized(send(sized(m, 60, 14), keys("enter", "e")...), 100, 26)
+	if m, _ = press(t, m, "esc"); m.mode != modeList {
+		t.Errorf("widening the pane under a form opened from details: esc leads to mode %v, want the list", m.mode)
+	}
+}
+
+func TestNarrowPaneOpensDetailsUnderAWaitingQuestion(t *testing.T) {
+	m := sized(sampleModel(), 60, 14)
+	m, _ = press(t, m, "down", "down", "down", "down", "enter")
+	if m.dialog == nil || m.mode != modeDetail {
+		t.Fatalf("enter on a waiting connection: dialog = %v, mode = %v", m.dialog != nil, m.mode)
+	}
+	m, _ = press(t, m, "esc")
+	if m.dialog != nil || m.mode != modeDetail {
+		t.Errorf("setting the question aside: dialog = %v, mode = %v; want its details", m.dialog != nil, m.mode)
+	}
+}
+
+func TestPickerTypesIntoTheFilterAndPicksAnAlias(t *testing.T) {
+	m := sized(sampleModel(), 100, 26)
+	m.installDefault = false
+	m, _ = press(t, m, "a", "j", "k")
+	if m.filter.Value() != "jk" || m.mode != modePick {
+		t.Fatalf("filter = %q, mode = %v; letters belong to the filter", m.filter.Value(), m.mode)
+	}
+	m, _ = press(t, m, "esc")
+	if m.mode != modeList {
+		t.Fatalf("esc: mode = %v, want the list", m.mode)
+	}
+	m, _ = press(t, m, "a", "s", "a", "n", "d")
+	if list := m.filtered(); len(list) != 1 || list[0].Name != "sandbox" {
+		t.Fatalf("filtered = %+v, want sandbox", list)
+	}
+	m, _ = press(t, m, "enter")
+	if m.mode != modeForm || m.editing != "" || m.fields[0].Value() != "sandbox" || m.fields[1].Value() != "sandbox" || m.install {
+		t.Errorf("picked: mode = %v, editing = %q, label = %q, target = %q, install = %v", m.mode, m.editing, m.fields[0].Value(), m.fields[1].Value(), m.install)
+	}
+	m, _ = press(t, m, "esc")
+	if m.mode != modeList {
+		t.Errorf("esc from a new form: mode = %v, want the list", m.mode)
+	}
+}
+
+func TestFormFieldsSwitchAndSave(t *testing.T) {
+	m := sized(sampleModel(), 100, 26)
+	m.installDefault = true
+	m, _ = press(t, m, "e", "space")
+	if m.fields[0].Value() != "prod-api " || !m.install {
+		t.Errorf("space in the label: label = %q, install = %v; want a typed space", m.fields[0].Value(), m.install)
+	}
+	m, _ = press(t, m, "tab", "tab", "tab", "space")
+	if m.field != 3 || m.install {
+		t.Errorf("space on the switch: field = %d, install = %v; want it turned off", m.field, m.install)
+	}
+	m, _ = press(t, m, "x")
+	if m.fields[0].Value() != "prod-api " {
+		t.Error("a letter on the switch reached a text field")
+	}
+	m, _ = press(t, m, "tab")
+	if m.field != 0 {
+		t.Errorf("tab from the last field: field = %d, want the first", m.field)
+	}
+	m, _ = promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyShiftTab})
+	if m.field != 3 {
+		t.Errorf("shift+tab from the first field: field = %d, want the last", m.field)
+	}
+
+	m.fields[1].SetValue("prod-new")
+	if _, ok := m.reconnects(); !ok {
+		t.Error("changing an active connection's target did not warn of a reconnect")
+	}
+	m.fields[1].SetValue("prod")
+	m.fields[0].SetValue("renamed")
+	if _, ok := m.reconnects(); ok {
+		t.Error("a label change warned of a reconnect; the daemon renames in place")
+	}
+
+	m.fields[0].SetValue(" ")
+	m, cmd := press(t, m, "enter")
+	if cmd != nil || m.mode != modeForm || m.failure == "" {
+		t.Errorf("empty label: command = %v, mode = %v, failure = %q; want the form kept with an error", cmd != nil, m.mode, m.failure)
+	}
+	m.fields[0].SetValue("renamed")
+	m, cmd = press(t, m, "enter")
+	if cmd == nil || m.mode != modeList {
+		t.Errorf("enter: command = %v, mode = %v; want a save and the list", cmd != nil, m.mode)
+	}
+}
+
+func TestForgetAsksFirst(t *testing.T) {
+	m := sized(sampleModel(), 100, 26)
+	m, cmd := press(t, m, "d")
+	if m.mode != modeForget || m.forget != "c1" || cmd != nil {
+		t.Fatalf("d: mode = %v, forget = %q, command = %v; want the confirmation only", m.mode, m.forget, cmd != nil)
+	}
+	if got, cmd := press(t, m, "esc"); got.mode != modeList || cmd != nil {
+		t.Errorf("esc: mode = %v, command = %v; want nothing forgotten", got.mode, cmd != nil)
+	}
+	if got, cmd := press(t, m, "y"); got.mode != modeForget || cmd != nil {
+		t.Error("only enter confirms")
+	}
+	if got, cmd := press(t, m, "enter"); got.mode != modeList || cmd == nil {
+		t.Errorf("enter: mode = %v, command = %v; want the forget requested", got.mode, cmd != nil)
+	}
+}
+
+func TestCtrlCClosesFromAnyMode(t *testing.T) {
+	for _, setup := range [][]string{nil, {"a"}, {"e"}, {"d"}, {"down", "down", "down", "down", "enter"}} {
+		m, _ := press(t, sized(sampleModel(), 100, 26), setup...)
+		if _, cmd := promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyCtrlC}); !isQuit(cmd) {
+			t.Errorf("after %v: ctrl+c did not close", setup)
 		}
-	}
-
-	m.conns = nil
-	m.cursor, m.offset = 0, 0
-	for _, key := range []tea.KeyType{tea.KeyPgDown, tea.KeyPgUp, tea.KeyHome, tea.KeyEnd, tea.KeyDown, tea.KeyUp, tea.KeyCtrlN, tea.KeyCtrlP} {
-		m, _ = pressKey(t, m, tea.KeyMsg{Type: key})
-		if m.cursor != 0 || m.offset != 0 {
-			t.Errorf("empty list after %s: cursor/offset = %d/%d", tea.KeyMsg{Type: key}, m.cursor, m.offset)
-		}
-	}
-}
-
-func TestListActionKeysOpenTheExpectedScreenWithoutRunningCommands(t *testing.T) {
-	base := newModel(context.Background(), nil)
-	base.conns = []daemon.Connection{conn("c1", "One", "host", false)}
-
-	for _, key := range []tea.KeyType{tea.KeyInsert, tea.KeyCtrlA} {
-		got, cmd := pressKey(t, base, tea.KeyMsg{Type: key})
-		if got.screen != screenAliases || cmd == nil {
-			t.Errorf("%s: screen = %v, command present = %v; want alias picker with load command", tea.KeyMsg{Type: key}, got.screen, cmd != nil)
-		}
-	}
-
-	for _, key := range []tea.KeyType{tea.KeyCtrlE, tea.KeyF2} {
-		got, cmd := pressKey(t, base, tea.KeyMsg{Type: key})
-		if got.screen != screenForm || got.editing != "c1" || cmd != nil {
-			t.Errorf("%s: screen = %v, editing = %q, command present = %v; want edit form", tea.KeyMsg{Type: key}, got.screen, got.editing, cmd != nil)
-		}
-	}
-
-	got, cmd := pressKey(t, base, tea.KeyMsg{Type: tea.KeyDelete})
-	if got.screen != screenConfirm || got.confirm == nil || cmd != nil {
-		t.Fatalf("Delete: screen = %v, confirm present = %v, command present = %v; want confirmation only", got.screen, got.confirm != nil, cmd != nil)
-	}
-	got, cmd = pressKey(t, got, tea.KeyMsg{Type: tea.KeyEnter})
-	if got.screen != screenList || got.confirm != nil || cmd == nil {
-		t.Errorf("Enter confirmation: screen = %v, confirm present = %v, command present = %v", got.screen, got.confirm != nil, cmd != nil)
-	}
-
-	for _, key := range []tea.KeyType{tea.KeyF5, tea.KeyCtrlR} {
-		got, cmd = pressKey(t, base, tea.KeyMsg{Type: key})
-		if got.screen != screenList || cmd == nil {
-			t.Errorf("%s: screen = %v, command present = %v; want refresh", tea.KeyMsg{Type: key}, got.screen, cmd != nil)
-		}
-	}
-}
-
-func TestAliasNavigationLeavesHomeAndEndForFilterEditing(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen, m.height = screenAliases, 10
-	m.aliases = make([]sshconfig.Alias, 12)
-	for i := range m.aliases {
-		m.aliases[i] = sshconfig.Alias{Name: fmt.Sprintf("host-%02d", i)}
-	}
-	m.aliasFilter.Focus()
-
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
-	if m.aliasCursor != m.aliasRows() {
-		t.Errorf("PageDown: alias cursor = %d, want one visible page (%d)", m.aliasCursor, m.aliasRows())
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlEnd})
-	if m.aliasCursor != len(m.aliases)-1 {
-		t.Errorf("Ctrl+End: alias cursor = %d, want final alias", m.aliasCursor)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlHome})
-	if m.aliasCursor != 0 || m.aliasOffset != 0 {
-		t.Errorf("Ctrl+Home: alias cursor/offset = %d/%d, want 0/0", m.aliasCursor, m.aliasOffset)
-	}
-
-	m.aliasFilter.SetValue("ost")
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyHome})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	if got := m.aliasFilter.Value(); got != "host" {
-		t.Errorf("Home then type: filter = %q, want insertion at start", got)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyEnd})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("-")})
-	if got := m.aliasFilter.Value(); got != "host-" {
-		t.Errorf("End then type: filter = %q, want insertion at end", got)
-	}
-	m.aliasFilter.SetValue("ost")
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlA})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	if got := m.aliasFilter.Value(); got != "host" || m.screen != screenAliases {
-		t.Errorf("Ctrl+A then type: filter = %q, screen = %v; want insertion at start", got, m.screen)
-	}
-}
-
-func TestFormNavigationPreservesTextAndSpaceTogglesOnlyCheckbox(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen = screenForm
-	m.label.SetValue("my")
-	m.target.SetValue("host")
-	m.focusField()
-
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
-	if m.label.Value() != "my " || m.install {
-		t.Errorf("space in label: value = %q, install = %v", m.label.Value(), m.install)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyTab})
-	if m.field != 1 || m.label.Value() != "my " || m.target.Value() != "host" {
-		t.Errorf("Tab: field = %d, label = %q, target = %q", m.field, m.label.Value(), m.target.Value())
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyShiftTab})
-	if m.field != 0 || m.label.Value() != "my " || m.target.Value() != "host" {
-		t.Errorf("Shift+Tab: field = %d, label = %q, target = %q", m.field, m.label.Value(), m.target.Value())
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlN})
-	if m.field != 1 || m.label.Value() != "my " || m.target.Value() != "host" {
-		t.Errorf("Ctrl+N: field = %d, label = %q, target = %q", m.field, m.label.Value(), m.target.Value())
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlP})
-	if m.field != 0 || m.label.Value() != "my " || m.target.Value() != "host" {
-		t.Errorf("Ctrl+P: field = %d, label = %q, target = %q", m.field, m.label.Value(), m.target.Value())
-	}
-	m.field = 3
-	m.focusField()
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
-	if !m.install || m.label.Value() != "my " {
-		t.Errorf("space on checkbox: install = %v, label = %q", m.install, m.label.Value())
-	}
-	m, cmd := pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlS})
-	if m.screen != screenList || cmd == nil {
-		t.Errorf("Ctrl+S: screen = %v, command present = %v; want save", m.screen, cmd != nil)
-	}
-}
-
-func TestFormCtrlAAndCtrlEEditTheCurrentField(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen = screenForm
-	m.label.SetValue("host")
-	m.focusField()
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlA})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlE})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
-	if m.screen != screenForm || m.label.Value() != "ahostz" {
-		t.Errorf("Ctrl+A/Ctrl+E in a form: screen = %v, label = %q", m.screen, m.label.Value())
-	}
-}
-
-func TestOutputCancelShortcutDoesNotConsumeLiteralInput(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen = screenOutput
-	m.conns = []daemon.Connection{conn("c1", "One", "host", false)}
-	m, _ = promptUpdate(t, m, jobMsg(waitingJob("job-1", "c1", "Enter code:")))
-	if m.dialog == nil {
-		t.Fatal("waiting job did not open an input dialog")
-	}
-
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	if m.dialog == nil || m.dialog.input.Value() != "x" || m.screen != screenOutput {
-		t.Errorf("typing x in dialog: dialog = %+v, screen = %v", m.dialog, m.screen)
-	}
-	m, cmd := pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlX})
-	if m.screen != screenOutput || m.dialog != nil || cmd == nil {
-		t.Errorf("Ctrl+X: screen = %v, dialog = %+v, command present = %v; want cancel command", m.screen, m.dialog, cmd != nil)
-	}
-}
-
-func TestDetailsEditReturnsToDetailsAfterDismissingPrompt(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen = screenOutput
-	m.conns = []daemon.Connection{conn("c1", "One", "host", false)}
-	m, _ = promptUpdate(t, m, jobMsg(waitingJob("job-1", "c1", "Enter code:")))
-	for _, letter := range "er" {
-		m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{letter}})
-	}
-	if m.dialog == nil || m.dialog.input.Value() != "er" || m.screen != screenOutput {
-		t.Fatalf("typing e/r in dialog: dialog = %+v, screen = %v", m.dialog, m.screen)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlA})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	if m.dialog == nil || m.dialog.input.Value() != "xer" {
-		t.Fatalf("Ctrl+A while answering: dialog = %+v", m.dialog)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlE})
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	if m.dialog == nil || m.dialog.input.Value() != "xery" {
-		t.Fatalf("Ctrl+E while answering: dialog = %+v; want insertion at end", m.dialog)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
-	if m.dialog != nil || m.screen != screenOutput {
-		t.Fatalf("Esc from dialog: dialog = %+v, screen = %v; want details", m.dialog, m.screen)
-	}
-	m, cmd := pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlE})
-	if m.screen != screenForm || m.formBack != screenOutput || m.editing != "c1" || m.label.Value() != "One" || m.target.Value() != "host" || cmd != nil {
-		t.Fatalf("Ctrl+E from details: screen = %v, back = %v, editing = %q, label = %q, target = %q, command present = %v", m.screen, m.formBack, m.editing, m.label.Value(), m.target.Value(), cmd != nil)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
-	if m.screen != screenOutput || m.dialog != nil {
-		t.Fatalf("Esc from edit: screen = %v, dialog = %+v; want details", m.screen, m.dialog)
-	}
-	m, _ = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlE})
-	m, cmd = pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlS})
-	if m.screen != screenOutput || cmd == nil {
-		t.Errorf("save from details: screen = %v, command present = %v; want return to details", m.screen, cmd != nil)
-	}
-}
-
-func TestDetailsCtrlEOpensEditWhenNotAnswering(t *testing.T) {
-	m := newModel(context.Background(), nil)
-	m.screen = screenOutput
-	m.conns = []daemon.Connection{conn("c1", "One", "host", false)}
-	m, cmd := pressKey(t, m, tea.KeyMsg{Type: tea.KeyCtrlE})
-	if m.screen != screenForm || m.formBack != screenOutput || m.editing != "c1" || cmd != nil {
-		t.Errorf("Ctrl+E from details: screen = %v, back = %v, editing = %q, command present = %v", m.screen, m.formBack, m.editing, cmd != nil)
 	}
 }

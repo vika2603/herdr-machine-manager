@@ -42,54 +42,52 @@ herdr server reload-config
 
 ## Using it
 
-The popup opens on the connection list. `●` means herdr currently holds the
-connection, `○` means only this plugin does.
+The popup has one screen: the connections on the left, and on the right a
+panel for the selected one with its settings, the address its SSH target
+resolves to, its state and the output of its latest job. Adding, editing,
+forgetting and answering a question take over the panel while the list stays
+in view. In a popup narrower than 76 columns the panel replaces the list, and
+`enter` opens the selected connection's details.
+
+Every state has one glyph and one word, used wherever it appears: `●`
+connected, `○` disconnected, `◌` queued, `◐` connecting or another job
+running, `◆` needs answer, `✕` failed (with the error). The bottom line lists
+the keys that apply right now; in a narrow popup it keeps the most important.
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓`, `Ctrl+P` / `Ctrl+N` | Move through connections |
-| `PageUp` / `PageDown` | Move by one visible page |
-| `Home` / `End` | Jump to the first / last connection |
-| `Ctrl+A` / `Insert` | Add a connection, picking an alias from `~/.ssh/config` |
-| `Ctrl+E` | Edit the selected connection: label, SSH target, remote session |
-| `space` | Connect or disconnect |
-| `Enter` | Show the selected connection's details and latest command output |
-| `Delete` | Open the forget confirmation; `Enter` confirms, `Esc` cancels |
-| `Ctrl+R` | Reload |
-| `Esc` | Close the popup |
+| `↑` / `↓` or `k` / `j`, `PageUp` / `PageDown`, `Home` / `End` | Move through connections |
+| `space` | Connect or disconnect; not while a job is pending |
+| `enter` | Answer the selected connection's question; in a narrow popup, open its details |
+| `a` | Add a connection, picking an alias from `~/.ssh/config` |
+| `e` | Edit label, SSH target, remote session and the install switch |
+| `d` | Forget the connection, after a confirmation |
+| `x` | Cancel the selected connection's unfinished job |
+| `r` | Re-read herdr's machine list |
+| `esc` | Close the popup, or step back from details, a form or a question |
 
-The alias picker supports arrows, `Ctrl+N` / `Ctrl+P`, and paging while you type
-to filter. `Ctrl+A` / `Ctrl+E` move to the start / end of the filter text.
-`Ctrl+Home` / `Ctrl+End` jump to the first / last alias; plain `Home` / `End`
-move within the filter text. In forms, `Tab` / `Shift+Tab`, `↓` / `↑`, or
-`Ctrl+N` / `Ctrl+P` move between fields. `Space` toggles the focused checkbox;
-`Enter` or `Ctrl+S` saves. `Esc` returns to the screen that opened the form.
-
-In connection details, `Ctrl+E` opens the edit form when no answer is being
-typed. `Ctrl+X` cancels an unfinished job, including one waiting for input.
-Confirmation dialogs use `Tab` or arrows to select No / Yes and `Enter` to
-submit; No is initially selected. Password dialogs hide the typed characters.
-In input dialogs, `Ctrl+A` / `Ctrl+E` move within the answer. `Esc` dismisses a
-dialog for later without answering or cancelling the job; select that connection
-and press `Enter` to reopen it. `Ctrl+C` closes the popup from any screen.
-The earlier letter shortcuts remain available for compatibility. The footer
-shows only the most common actions on one line, with fewer hints in narrow
-popups. All shortcuts listed above remain available.
+In the alias picker, typing filters by alias or host, `↑` / `↓` move, `enter`
+picks. Aliases already added are marked. In the form, `tab` / `shift+tab` or
+`↓` / `↑` move between fields, `space` toggles the install switch, `enter`
+saves. The form shows the `herdr machine add` command it will run and warns
+when saving disconnects and reconnects an active connection. The forget
+confirmation says whether the connection is also removed from herdr; `enter`
+forgets, `esc` keeps it.
 
 Connecting runs `herdr machine add`, which prepares the remote host and can take
-minutes. It runs in the background: the row shows `connecting…`, the popup can
-be closed, and a herdr toast reports the result. When the command needs a
-confirmation, password or another answer, a compact standalone input popup opens
-without the manager list. It identifies the connection and closes after the last
-answer or dismissal. If the manager is already open, it shows the question in
-place. Multiple questions are shown one at a time. Dismissing a question does
-not repeatedly reopen it.
+minutes. It runs in the background: the popup can be closed, and a herdr toast
+reports the result. When the command asks a question, an open manager shows it
+in the panel; otherwise a small standalone popup opens with the question alone
+and closes after the last answer or dismissal. Questions come one at a time. A
+confirmation starts on No and `←` / `→` choose; a password is masked. `esc` sets
+a question aside without answering or cancelling the job; it does not reopen by
+itself until a different question arrives, and `enter` on the connection opens
+it again.
 
-The form asks up front whether installing herdr on a remote that lacks it is
-allowed. When allowed, the actual installation still asks for confirmation;
-when disabled, the daemon declines installation. Replacing an incompatible
-remote server also requires confirmation. Passwords are never answered on your
-behalf.
+The install switch decides whether installing herdr on a remote that lacks it
+is allowed. When allowed, the installation still asks for confirmation; when
+off, the daemon declines it. Replacing an incompatible remote server also asks.
+Passwords are never answered on your behalf.
 
 A machine added outside the plugin, with `herdr machine add` on a command line,
 is adopted into the list rather than ignored.
