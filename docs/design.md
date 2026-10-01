@@ -25,11 +25,12 @@ socket API is used for panes and notifications, not for this data.
 
 A saved machine is a `SavedSshEndpoint` with five fields — id, label, SSH
 target, explicit remote session, enabled flag — kept in
-`~/.config/herdr/endpoints.json`, with the current selection beside it in
-`endpoint-selection.json`. `herdr machine list --json` reports them as `id`,
-`label`, `target`, `session`, `enabled` and `selected`; a profile id is 32
-lowercase hexadecimal characters. These subcommands are parsed by hand, and the
-positional argument must precede the flags, whatever the clap-style ordering in
+`$XDG_STATE_HOME/herdr/client/endpoints.json`
+(`~/.local/state/herdr/client/endpoints.json` by default), with the current
+selection beside it in `endpoint-selection.json`. `herdr machine list --json`
+reports them as `id`, `label`, `target`, `session`, `enabled` and `selected`;
+a profile id is 32 lowercase hexadecimal characters. These subcommands are parsed
+by hand, and the positional argument must precede the flags, whatever the clap-style ordering in
 `--help` suggests.
 
 Two properties of that surface shape everything below:
@@ -138,13 +139,18 @@ have to resolve its own socket and state directories.
   written on every change. herdr's list is read at start, after every job that
   mutates it, and every two seconds to discover changes made outside the plugin.
   Polling the CLI avoids depending on where Herdr stores its endpoint file.
-  Reconciliation is serialized: the job hook, the poll and an explicit refresh can fire at once,
-  and two of them would each decide a machine is unclaimed and adopt it twice.
+  Reconciliation is serialized: the job hook, the poll and an explicit refresh
+  can fire at once, and two of them would each decide a machine is unclaimed and
+  adopt it twice. A poll broadcasts and advances the revision only when the
+  reconciled connections change; an explicit refresh always does both.
 - **Job queue, ordered per connection.** Each job waits for its predecessor on
   that connection; different connections run in parallel. Submission cannot
   fail after a connection is saved. A reconnect is one connect job that removes
   the old endpoint before adding the new one; a failed removal stops the job.
-  No queue capacity, batch admission, rollback, or idle worker is needed.
+  No queue capacity, batch admission, rollback, or idle worker is needed. A
+  connect or disconnect is a no-op while that connection already has an
+  unfinished job, preventing repeated requests from queuing duplicate work.
+  Form saves still queue their requested changes.
 - **PTY execution for `connect`.** The command runs under a PTY the daemon
   allocates, at a fixed 120×40, so `ssh` and herdr's own prompts behave as they
   do in a terminal. Output is kept as a bounded tail and broadcast line by line.
@@ -160,9 +166,9 @@ instance exits without replacing the socket. The ping version identifies the
 running executable's modification time, so rebuilding also changes its identity.
 When an action or pane finds a different build, it leaves that daemon running
 while any job is unfinished. Once idle, the next open asks it to quit and takes
-over without restarting herdr. That request ends the older daemon's context rather than merely closing its listener:
-a popup's open subscription would otherwise keep it serving, and its lock held,
-until the user closed that popup.
+over without restarting herdr. That request ends the older daemon's context
+rather than merely closing its listener: a popup's open subscription would
+otherwise keep it serving, and its lock held, until the user closed that popup.
 
 Startup is not supervised, so the daemon can also be missing — herdr was already
 running when the plugin was linked, or it crashed. Both the action and the TUI
@@ -261,8 +267,9 @@ alias picker → form (label, target, remote session, install?)
 
 **Prompt handling.** List connections require both the request and
 `install_remote` to allow installation; form saves use the form's explicit
-choice. Explicitly disabled installation is declined. Other questions move the job to `awaiting_input`. When no UI is subscribed, the daemon
-opens the separate `prompt` pane (64 by 13 cells), without the manager list or
+choice. Explicitly disabled installation is declined. Other questions move the
+job to `awaiting_input`. When no UI is subscribed, the daemon opens the separate
+`prompt` pane (64 by 13 cells), without the manager list or
 its footer. It handles questions from live events or the initial snapshot and
 closes when all have been answered or dismissed. An already-open manager shows
 the question in its detail panel, respecting Herdr's single-popup limit.
@@ -279,6 +286,13 @@ A prompt is the unterminated text output stopped on. It stops being a prompt
 when that line ends, not when any output arrives: a command that prints progress
 while it waits must not clear the input field the user is typing into.
 
+**Preflight** is designed but not implemented: `ssh -G <target>` to confirm the
+alias resolves, `ssh -o BatchMode=yes -o ConnectTimeout=5 <target> true` to
+learn whether the host authenticates without a prompt, and
+`ssh -o BatchMode=yes <target> 'command -v herdr'` to learn whether the remote
+already has herdr. The form controls whether installing is allowed; permitted
+installation still requires confirmation when the command asks.
+
 **Cancellation** signals the process group, and sends SIGKILL after a grace
 period: a command that ignores SIGTERM would otherwise hold its connection's
 queue for as long as herdr runs. `herdr machine add` saves nothing until the
@@ -289,9 +303,9 @@ The connection stays in the store either way — it is simply not active.
 ### 5.3 What is kept
 
 The queue holds every unfinished job plus the last finished one per connection:
-the error a failed row shows, and the output its detail view shows. Each finished
-job replaces the previous finished job for its connection. There is no history to
-browse and no endpoint to read one from — `connections.list` carries that whole
+the error a failed row shows, and the output its detail view shows. Each
+finished job replaces the previous finished job for its connection. There is no
+history to browse and no endpoint to read one from — `connections.list` carries that whole
 set, because it is small by construction.
 
 Output travels once: the list carries each job's tail, the progress events that
@@ -319,8 +333,8 @@ aliases, so the file is parsed for `Host` lines:
 **Details — `ssh -G <alias>`.** The effective `hostname`, `user` and `port` come
 from `ssh -G`, which prints the fully resolved configuration, rather than from
 reimplementing OpenSSH's precedence rules. Resolution uses up to eight workers,
-and a failure degrades to showing the alias alone. Enumeration and resolution run on
-each aliases request; there is no mtime or TTL cache. Default paths and tilde
+and a failure degrades to showing the alias alone. Enumeration and resolution
+run on each aliases request; there is no mtime or TTL cache. Default paths and tilde
 expansion are handled by the alias parser.
 
 ## 7. The interface

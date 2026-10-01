@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +85,108 @@ func TestConnectHonorsInstallationPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReconnectRemovesCurrentEndpointBeforeAdd(t *testing.T) {
+	for _, tc := range []struct {
+		name, currentID, removeResult, wantCalls string
+		wantState                                jobs.State
+	}{
+		{"changed endpoint", "current", "", "remove:current\nadd\n", jobs.StateSucceeded},
+		{"endpoint gone", "", "", "add\n", jobs.StateSucceeded},
+		{"removal failed", "current", "exit 7", "remove:current\n", jobs.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestDaemon(t)
+			conn, err := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "stale"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			trace := filepath.Join(t.TempDir(), "calls")
+			t.Setenv("MM_TEST_TRACE", trace)
+			t.Setenv("MM_TEST_REMOVE_RESULT", tc.removeResult)
+			d.cli = machines.CLI{Bin: fakeHerdr(t, `case "$2" in
+ remove) echo "remove:$3" >> "$MM_TEST_TRACE"; eval "$MM_TEST_REMOVE_RESULT";;
+ add) echo add >> "$MM_TEST_TRACE";;
+ esac`)}
+			release := blockConnectionJob(t, d, conn.ID)
+			id := d.enqueue(conn, jobs.KindConnect, true, true)
+			conn.ProfileID = tc.currentID
+			if _, err := d.store.Put(conn); err != nil {
+				t.Fatal(err)
+			}
+			release()
+			waitForJobState(t, d.queue, id, tc.wantState)
+			calls, err := os.ReadFile(trace)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if string(calls) != tc.wantCalls {
+				t.Fatalf("calls = %q, want %q", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestQueuedEndpointJobUsesCurrentProfileID(t *testing.T) {
+	for _, tc := range []struct {
+		name, currentID, wantCalls string
+		kind                       jobs.Kind
+	}{
+		{"disconnect changed endpoint", "current", "remove:current\n", jobs.KindDisconnect},
+		{"disconnect endpoint gone", "", "", jobs.KindDisconnect},
+		{"rename changed endpoint", "current", "rename:current:Deploy\n", jobs.KindRename},
+		{"rename endpoint gone", "", "", jobs.KindRename},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestDaemon(t)
+			conn, err := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "stale"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			trace := filepath.Join(t.TempDir(), "calls")
+			t.Setenv("MM_TEST_TRACE", trace)
+			d.cli = machines.CLI{Bin: fakeHerdr(t, `case "$2" in
+ remove) echo "remove:$3" >> "$MM_TEST_TRACE";;
+ rename) echo "rename:$3:$5" >> "$MM_TEST_TRACE";;
+ esac`)}
+			release := blockConnectionJob(t, d, conn.ID)
+			id := d.enqueue(conn, tc.kind, false, false)
+			conn.ProfileID = tc.currentID
+			if _, err := d.store.Put(conn); err != nil {
+				t.Fatal(err)
+			}
+			release()
+			waitForJobState(t, d.queue, id, jobs.StateSucceeded)
+			calls, err := os.ReadFile(trace)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if string(calls) != tc.wantCalls {
+				t.Fatalf("calls = %q, want %q", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func blockConnectionJob(t *testing.T, d *Daemon, connID string) func() {
+	t.Helper()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	d.queue.Submit(connID, jobs.Spec{Run: func(_ context.Context, _ jobs.Sink) error {
+		close(started)
+		<-release
+		return nil
+	}})
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocking job did not start")
+	}
+	var once sync.Once
+	done := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(done)
+	return done
 }
 
 func waitForJobState(t *testing.T, q *jobs.Queue, id string, state jobs.State) {

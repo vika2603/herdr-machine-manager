@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -48,20 +49,59 @@ func TestEnsurePreservesOutdatedDaemonWithPendingJobs(t *testing.T) {
 }
 
 func TestSpawnEnvironment(t *testing.T) {
-	t.Setenv("HERDR_PLUGIN_ACTION_ID", "open")
-	t.Setenv("HERDR_PLUGIN_ENTRYPOINT_ID", "manager")
+	for _, key := range []string{
+		"HERDR_PLUGIN_ACTION_ID", "HERDR_PLUGIN_ENTRYPOINT_ID",
+		"HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_EVENT_JSON",
+		"HERDR_PLUGIN_CLICKED_URL", "HERDR_PLUGIN_LINK_HANDLER_ID",
+		"HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_PANE_RUNTIME_ID",
+		"HERDR_ACTIVE_WORKSPACE_ID", "HERDR_ACTIVE_TAB_ID",
+		"HERDR_ACTIVE_PANE_ID", "HERDR_ACTIVE_PANE_CWD",
+	} {
+		t.Setenv(key, "stale-invocation")
+	}
+	t.Setenv("HERDR_PLUGIN_EVENT", "pane.opened")
+	t.Setenv("HERDR_PLUGIN_ID", "stale-plugin")
+	t.Setenv("HERDR_PLUGIN_CONFIG_DIR", "/stale/config")
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", "/stale/state")
+	t.Setenv("HERDR_SOCKET_PATH", "/stale/socket")
+	t.Setenv("HERDR_BIN_PATH", "/stale/herdr")
+	t.Setenv("HERDR_SESSION", "shared-session")
 	t.Setenv("MM_TEST_INHERITED", "present")
-	env := &plugin.Env{PluginID: "test.manager", StateDir: t.TempDir(), BinPath: "/fake/herdr"}
+	env := &plugin.Env{
+		PluginID: "test.manager", PluginRoot: "/plugin", ConfigDir: "/plugin/config",
+		StateDir: t.TempDir(), SocketPath: "/herdr/socket", BinPath: "/fake/herdr",
+	}
 	vars := map[string]string{}
 	for _, item := range daemonEnv(env) {
 		key, value, _ := strings.Cut(item, "=")
 		vars[key] = value
 	}
+	for _, key := range []string{
+		"HERDR_PLUGIN_ACTION_ID", "HERDR_PLUGIN_ENTRYPOINT_ID",
+		"HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_EVENT_JSON",
+		"HERDR_PLUGIN_CLICKED_URL", "HERDR_PLUGIN_LINK_HANDLER_ID",
+		"HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_PANE_RUNTIME_ID",
+		"HERDR_ACTIVE_WORKSPACE_ID", "HERDR_ACTIVE_TAB_ID",
+		"HERDR_ACTIVE_PANE_ID", "HERDR_ACTIVE_PANE_CWD",
+	} {
+		if _, found := vars[key]; found {
+			t.Errorf("spawn leaked per-invocation variable %s", key)
+		}
+	}
 	loaded, err := plugin.LoadFrom(func(key string) (string, bool) { value, ok := vars[key]; return value, ok })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Kind() != plugin.KindStartup || loaded.StateDir != env.StateDir || loaded.BinPath != env.BinPath || vars["MM_TEST_INHERITED"] != "present" {
+	if loaded.Kind() != plugin.KindStartup || loaded.PluginID != env.PluginID ||
+		loaded.PluginRoot != env.PluginRoot || loaded.ConfigDir != env.ConfigDir ||
+		loaded.StateDir != env.StateDir || loaded.SocketPath != env.SocketPath ||
+		loaded.BinPath != env.BinPath || vars["HERDR_SESSION"] != "shared-session" ||
+		vars["MM_TEST_INHERITED"] != "present" {
 		t.Fatal("spawn lost explicit environment or inherited startup context")
+	}
+	cmd := exec.Command("sh", "-c", `test -z "${HERDR_PANE_ID+x}" && test -z "${HERDR_PLUGIN_ACTION_ID+x}" && test -z "${HERDR_PLUGIN_CONTEXT_JSON+x}" && test "$HERDR_PLUGIN_EVENT" = startup && test "$MM_TEST_INHERITED" = present`)
+	cmd.Env = daemonEnv(env)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("spawned process received stale invocation context: %v", err)
 	}
 }

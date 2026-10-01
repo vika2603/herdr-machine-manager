@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -49,6 +50,8 @@ type Daemon struct {
 	// reload serializes reconciliation. Two refreshes racing would each decide
 	// a machine is unclaimed and adopt it twice.
 	reload sync.Mutex
+	// Checking for unfinished work and submitting its successor must be atomic.
+	submitMu sync.Mutex
 
 	mu       sync.Mutex
 	conns    []Connection
@@ -84,6 +87,9 @@ func Run(ctx context.Context, env *plugin.Env) error {
 	defer func() { _ = lock.Close() }()
 	// Binding alone cannot serialize removal of a stale socket by two starters.
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("daemon: another instance is running: %w", err)
+		}
 		return err
 	}
 
@@ -109,7 +115,7 @@ func Run(ctx context.Context, env *plugin.Env) error {
 	d.server = server
 	defer func() { _ = server.Close() }()
 
-	d.refresh(ctx)
+	d.refresh(ctx, false)
 
 	go d.watchMachines(ctx)
 
@@ -142,7 +148,7 @@ func (d *Daemon) handle(ctx context.Context, method string, params json.RawMessa
 		return ipc.PingResult{PluginID: d.env.PluginID, Version: Version, PID: os.Getpid()}, nil
 	case ipc.MethodList, ipc.MethodRefresh:
 		if method == ipc.MethodRefresh {
-			d.refresh(ctx)
+			d.refresh(ctx, true)
 		}
 		return d.snapshot(), nil
 	case ipc.MethodAliasesList:
@@ -227,7 +233,7 @@ func (d *Daemon) save(ctx context.Context, p ipc.SaveParams) (ipc.SaveResult, er
 	case previous.Label != saved.Label:
 		kind = jobs.KindRename
 	}
-	return d.submit(ctx, saved, kind, p.Install, existed && reconnect), nil
+	return d.submit(ctx, saved, kind, p.Install, existed && reconnect, false), nil
 }
 
 func (d *Daemon) act(ctx context.Context, method string, p ipc.ConnectionTarget) (ipc.SaveResult, error) {
@@ -251,19 +257,29 @@ func (d *Daemon) act(ctx context.Context, method string, p ipc.ConnectionTarget)
 	case method == ipc.MethodForget:
 		kind = jobs.KindForget
 	}
-	return d.submit(ctx, conn, kind, p.Install && d.cfg.InstallRemote, false), nil
+	return d.submit(ctx, conn, kind, p.Install && d.cfg.InstallRemote, false, kind == jobs.KindConnect || kind == jobs.KindDisconnect), nil
 }
 
-func (d *Daemon) submit(ctx context.Context, conn store.Connection, kind jobs.Kind, install, reconnect bool) ipc.SaveResult {
+func (d *Daemon) submit(ctx context.Context, conn store.Connection, kind jobs.Kind, install, reconnect, onlyIdle bool) ipc.SaveResult {
 	result := ipc.SaveResult{ID: conn.ID}
 	if kind != "" {
+		d.submitMu.Lock()
+		if onlyIdle {
+			for _, job := range d.queue.List() {
+				if job.ConnID == conn.ID && !job.State.Terminal() {
+					d.submitMu.Unlock()
+					return result
+				}
+			}
+		}
 		result.Jobs = []string{d.enqueue(conn, kind, install, reconnect)}
+		d.submitMu.Unlock()
 	}
-	d.refresh(ctx)
+	d.refresh(ctx, false)
 	return result
 }
 
-func (d *Daemon) refresh(ctx context.Context) {
+func (d *Daemon) refresh(ctx context.Context, force bool) {
 	d.reload.Lock()
 	defer d.reload.Unlock()
 
@@ -275,16 +291,20 @@ func (d *Daemon) refresh(ctx context.Context) {
 		conns = d.reconcile(actual)
 	}
 	d.mu.Lock()
+	changed := force || (err == nil && !slices.Equal(d.conns, conns))
 	d.cacheErr = ""
 	if err != nil {
 		d.cacheErr = err.Error()
 	} else {
 		d.conns = conns
 	}
-	d.revision++
+	if changed {
+		d.revision++
+	}
 	d.mu.Unlock()
-
-	d.broadcast(ipc.EventConnectionsChanged, d.snapshot())
+	if changed {
+		d.broadcast(ipc.EventConnectionsChanged, d.snapshot())
+	}
 }
 
 // Poll the CLI itself: external edits need not share the daemon's socket directory.
@@ -296,7 +316,7 @@ func (d *Daemon) watchMachines(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.refresh(ctx)
+			d.refresh(ctx, false)
 		}
 	}
 }

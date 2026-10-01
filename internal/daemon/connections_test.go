@@ -113,7 +113,7 @@ func TestSaveAdmitsWholeReconnectAndRejectsFailedWrite(t *testing.T) {
 		if err := d.cli.Remove(ctx, original.ProfileID); err != nil {
 			return err
 		}
-		d.refresh(ctx)
+		d.refresh(ctx, false)
 		return nil
 	}})
 	for range 12 {
@@ -155,7 +155,7 @@ func TestConcurrentRefreshAdoptsOnce(t *testing.T) {
 	d.cli = machines.CLI{Bin: fakeHerdr(t, `echo '[{"id":"ep-1","label":"Build","target":"build"}]'`)}
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Go(func() { d.refresh(t.Context()) })
+		wg.Go(func() { d.refresh(t.Context(), false) })
 	}
 	wg.Wait()
 	if len(d.store.List()) != 1 || len(d.snapshot().Connections) != 1 {

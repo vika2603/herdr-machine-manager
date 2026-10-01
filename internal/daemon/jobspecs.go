@@ -16,9 +16,9 @@ import (
 func (d *Daemon) enqueue(conn store.Connection, kind jobs.Kind, install, reconnect bool) string {
 	return d.queue.Submit(conn.ID, jobs.Spec{Kind: kind, Title: string(kind) + " " + conn.Label,
 		Run: func(ctx context.Context, sink jobs.Sink) error {
+			current, _ := d.store.Get(conn.ID)
 			switch kind {
 			case jobs.KindConnect:
-				current, _ := d.store.Get(conn.ID)
 				if reconnect && current.ProfileID != "" {
 					if err := d.cli.Remove(ctx, current.ProfileID); err != nil {
 						return err
@@ -30,12 +30,11 @@ func (d *Daemon) enqueue(conn store.Connection, kind jobs.Kind, install, reconne
 				}
 				return jobs.Exec(ctx, append([]string{bin}, d.cli.AddArgs(conn.Target, conn.Label, conn.Session)...), addAnswers(install), sink)
 			case jobs.KindRename:
-				return d.cli.Rename(ctx, conn.ProfileID, conn.Label)
-			default:
-				current := conn
-				if kind == jobs.KindForget {
-					current, _ = d.store.Get(conn.ID)
+				if current.ProfileID == "" {
+					return nil
 				}
+				return d.cli.Rename(ctx, current.ProfileID, conn.Label)
+			default:
 				if current.ProfileID != "" {
 					if err := d.cli.Remove(ctx, current.ProfileID); err != nil {
 						return err
@@ -80,7 +79,7 @@ func (d *Daemon) onJobUpdate(job jobs.Job) {
 	if !job.State.Terminal() {
 		return
 	}
-	d.refresh(context.Background())
+	d.refresh(context.Background(), false)
 	if !d.cfg.Notifications {
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -103,9 +104,25 @@ func spawn(ctx context.Context, env *plugin.Env) error {
 	return fmt.Errorf("daemon: no answer within %s; see %s", startTimeout, logPath)
 }
 
-// Startup takes precedence over inherited pane/action markers in plugin.Load.
 func daemonEnv(env *plugin.Env) []string {
-	return append(os.Environ(),
+	// Invocation context belongs to the action or pane that started the daemon,
+	// not to the resident process or the commands it runs later.
+	vars := make([]string, 0, len(os.Environ())+8)
+	for _, item := range os.Environ() {
+		key, _, _ := strings.Cut(item, "=")
+		switch key {
+		case "HERDR_PLUGIN_ACTION_ID", "HERDR_PLUGIN_ENTRYPOINT_ID",
+			"HERDR_PLUGIN_EVENT", "HERDR_PLUGIN_CONTEXT_JSON",
+			"HERDR_PLUGIN_EVENT_JSON", "HERDR_PLUGIN_CLICKED_URL",
+			"HERDR_PLUGIN_LINK_HANDLER_ID", "HERDR_WORKSPACE_ID",
+			"HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_PANE_RUNTIME_ID",
+			"HERDR_ACTIVE_WORKSPACE_ID", "HERDR_ACTIVE_TAB_ID",
+			"HERDR_ACTIVE_PANE_ID", "HERDR_ACTIVE_PANE_CWD":
+			continue
+		}
+		vars = append(vars, item)
+	}
+	return append(vars,
 		"HERDR_ENV=1", "HERDR_PLUGIN_EVENT=startup",
 		"HERDR_PLUGIN_ID="+env.PluginID,
 		"HERDR_PLUGIN_ROOT="+env.PluginRoot,
