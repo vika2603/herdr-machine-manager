@@ -9,27 +9,38 @@ import (
 	"github.com/vika2603/herdr-client/herdr"
 
 	"github.com/vika2603/herdr-machine-manager/internal/daemon"
+	"github.com/vika2603/herdr-machine-manager/internal/ipc"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 	"github.com/vika2603/herdr-machine-manager/internal/sshconfig"
 )
 
-type screen int
+// mode is what the panel beside the connection list shows. In a pane too
+// narrow for both, the panel replaces the list.
+type mode int
 
 const (
-	screenList screen = iota
-	screenAliases
-	screenForm
-	screenConfirm
-	// screenOutput shows what the command behind one connection is doing, and
-	// is where an answer it is waiting for is typed. There is no job list: a
-	// job belongs to a connection, so its state is shown on that row.
-	screenOutput
+	modeList mode = iota
+	// modeDetail opens the selected connection's panel on its own, which only
+	// a narrow pane needs: a wide one shows it beside the list.
+	modeDetail
+	modePick
+	modeForm
+	modeForget
 )
 
-// outputTail is how many lines of a job's output the job view shows.
-const outputTail = 12
+// outputLimit bounds the output buffered per job, as the daemon does.
+const outputLimit = 200
 
+// listMsg is a list the subscription delivered, in order with the job events
+// around it; replyMsg is the reply to a request, which travels apart from the
+// subscription and may be older than events that arrived before it. asked is
+// the number of subscription messages the model had received when it sent
+// the request.
 type listMsg daemon.ListResult
+type replyMsg struct {
+	daemon.ListResult
+	asked int
+}
 type aliasesMsg daemon.AliasesResult
 type jobMsg jobs.Job
 type outputMsg struct {
@@ -38,221 +49,241 @@ type outputMsg struct {
 }
 type statusMsg string
 type failureMsg string
+
+// linkMsg is a failure to reach the daemon, cleared by the next list it sends.
+type linkMsg string
 type reconnectMsg struct{}
 
 type model struct {
 	ctx    context.Context
 	client *herdr.Client
 
-	screen        screen
 	width, height int
+	mode          mode
+	// back is the mode the picker, the form and the forget confirmation
+	// return to.
+	back mode
 
 	conns   []daemon.Connection
-	active  []jobs.Job
-	allJobs []jobs.Job
+	jobs    []jobs.Job
 	outputs map[string][]string
 	cursor  int
 	offset  int
 
-	status  string
-	failure string
+	// failure is a rejected request, cleared by the next accepted one; link is
+	// a failure to reach the daemon or the error it reports; config is the
+	// config file's error, which lasts until the popup is reopened.
+	status, failure, link, config string
 
 	aliases     []sshconfig.Alias
 	aliasCursor int
-	aliasOffset int
-	aliasFilter textinput.Model
+	filter      textinput.Model
 
-	// editing is the connection the form is editing, empty when it creates one.
-	editing                string
-	formBack               screen
-	label, target, session textinput.Model
-	field                  int
-	install                bool
-	installDefault         bool
+	// editing is the connection the form edits, empty when it creates one.
+	editing        string
+	fields         [3]textinput.Model // label, target, session
+	field          int                // 0-2 the inputs, 3 the install switch
+	install        bool
+	installDefault bool
 
-	confirm *daemon.Connection
+	forget string
 
-	dialog           *promptDialog
-	dismissedPrompts map[string]bool
+	// received counts the messages the subscription delivered; listed,
+	// jobSeen and outSeen record the count at the last list and at the last
+	// update and output of each job, so a reply never undoes what arrived
+	// after it was requested. revision is that of the last list applied, and
+	// loaded tells whether one was.
+	received, listed, revision int
+	jobSeen, outSeen           map[string]int
+	loaded                     bool
+
+	dialog    *promptDialog
+	dismissed map[string]bool
 }
 
 func newModel(ctx context.Context, client *herdr.Client) model {
 	input := func(placeholder string) textinput.Model {
 		in := textinput.New()
-		in.Placeholder = placeholder
-		in.Prompt = "› "
+		in.Placeholder, in.Prompt, in.PlaceholderStyle = placeholder, "", mutedStyle
 		return in
 	}
 	return model{
-		ctx:         ctx,
-		client:      client,
-		outputs:     map[string][]string{},
-		aliasFilter: input("alias or host"),
-		label:       input("label shown in the sidebar"),
-		target:      input("ssh target"),
-		session:     input("remote session (optional)"),
+		ctx:     ctx,
+		client:  client,
+		outputs: map[string][]string{},
+		jobSeen: map[string]int{},
+		outSeen: map[string]int{},
+		filter:  input("type to filter"),
+		fields:  [3]textinput.Model{input("shown in the sidebar"), input("ssh alias or user@host"), input("default")},
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	// The aliases are loaded up front as well: the list shows the resolved
-	// host behind each target.
-	return tea.Batch(m.loadList(), m.loadAliases())
+	// Aliases are loaded up front: the panel shows the address behind a target.
+	return tea.Batch(m.call(ipc.MethodList), m.loadAliases())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.offset = scroll(m.offset, m.cursor, m.rows())
-		m.aliasOffset = scroll(m.aliasOffset, m.aliasCursor, m.aliasRows())
-		return m, nil
-
-	case listMsg:
-		m.conns = msg.Connections
-		m.mergeJobs(msg.Jobs)
-		m.failure = msg.Error
-		if m.cursor >= len(m.conns) {
-			m.cursor = max(0, len(m.conns)-1)
+		if m.wide() {
+			m.mode, m.back = map[bool]mode{true: modeList, false: m.mode}[m.mode == modeDetail], modeList
 		}
-		return m, nil
-
+	case listMsg:
+		m.received++
+		m.listed = m.received
+		m.applyList(daemon.ListResult(msg), m.received)
+	case replyMsg:
+		// A list the subscription delivered after the request is at least
+		// as new as the reply, and every later change follows it as an event.
+		if m.listed <= msg.asked {
+			m.applyList(msg.ListResult, msg.asked)
+		}
 	case aliasesMsg:
 		m.aliases = msg.Aliases
-		m.status = ""
 		if msg.Error != "" {
-			m.failure = msg.Error
+			m.link = msg.Error
 		}
-		return m, nil
-
 	case jobMsg:
+		m.received++
+		m.jobSeen[msg.ID] = m.received
 		m.mergeJob(jobs.Job(msg))
-		return m, nil
-
 	case outputMsg:
-		m.outputs[msg.jobID] = append(m.outputs[msg.jobID], msg.lines...)
-		if extra := len(m.outputs[msg.jobID]) - 200; extra > 0 {
-			m.outputs[msg.jobID] = m.outputs[msg.jobID][extra:]
-		}
-		return m, nil
-
+		m.received++
+		m.outSeen[msg.jobID] = m.received
+		out := append(m.outputs[msg.jobID], msg.lines...)
+		m.outputs[msg.jobID] = out[max(0, len(out)-outputLimit):]
 	case statusMsg:
-		m.status = string(msg)
-		m.failure = ""
-		return m, nil
-
+		m.status, m.failure = string(msg), ""
 	case failureMsg:
 		m.failure = string(msg)
-		return m, nil
-
+	case linkMsg:
+		m.link = string(msg)
 	case reconnectMsg:
-		m.status = "reconnecting to the daemon"
-		return m, m.loadList()
-
+		// A new subscription may reach a restarted daemon, whose revisions
+		// start again; replies requested before it are dropped.
+		m.received++
+		m.listed, m.revision = m.received, 0
+		return m, m.call(ipc.MethodList)
 	case promptReplyMsg:
-		if m.dialog != nil && m.dialog.jobID == msg.jobID && m.dialog.prompt == msg.prompt {
-			m.dialog.sending = false
+		if d := m.dialog; d != nil && d.jobID == msg.jobID && d.prompt == msg.prompt {
+			d.sending = false
 			if msg.err != nil {
-				m.dialog.failure = msg.err.Error()
+				d.failure = msg.err.Error()
 			} else {
 				m.dismissPrompt()
-				m.syncPrompt()
 			}
 		}
-		return m, nil
-
 	case tea.KeyMsg:
 		return m.key(msg)
 	}
 	return m, nil
 }
 
-// forgetOutputs drops the output buffered for jobs the daemon no longer keeps.
-func (m *model) forgetOutputs() {
-	known := make(map[string]bool, len(m.allJobs))
-	for _, job := range m.allJobs {
-		known[job.ID] = true
+// applyList takes the connections and jobs of a list unless a list with a
+// higher revision was applied. The list's jobs replace the known ones, and its
+// tails what the popup buffered: the daemon saw everything, including what
+// streamed while this popup was disconnected from it. A job update or output
+// the subscription delivered after asked is newer than the list and stays.
+func (m *model) applyList(list daemon.ListResult, asked int) {
+	if list.Revision < m.revision {
+		return
 	}
-	for id := range m.outputs {
-		if !known[id] {
-			delete(m.outputs, id)
+	m.revision, m.loaded = list.Revision, true
+	c, _ := m.current()
+	selected := c.ID
+	m.conns, m.link = list.Connections, list.Error
+	m.cursor = clamp(m.cursor, len(m.conns))
+	if i := index(m.conns, func(c daemon.Connection) bool { return c.ID == selected }); i >= 0 {
+		m.cursor = i
+	}
+
+	merged := append([]jobs.Job(nil), list.Jobs...)
+	for i, job := range merged {
+		if current, ok := find(m.jobs, func(j jobs.Job) bool { return j.ID == job.ID }); ok && m.jobSeen[job.ID] > asked {
+			merged[i] = current
 		}
 	}
-}
-
-// mergeJobs replaces the known jobs with the set the daemon keeps. Its tails
-// come from the daemon, which saw everything, so they replace what the popup
-// buffered: a reconnect would otherwise keep showing what it had before the
-// stream dropped.
-func (m *model) mergeJobs(list []jobs.Job) {
-	m.allJobs = list
-	m.active = activeJobs(list)
-	for _, job := range list {
-		if len(job.Tail) > 0 {
+	for _, job := range m.jobs {
+		if m.jobSeen[job.ID] > asked && index(merged, func(j jobs.Job) bool { return j.ID == job.ID }) < 0 {
+			merged = append(merged, job)
+		}
+	}
+	m.jobs = merged
+	for _, job := range merged {
+		if len(job.Tail) > 0 && m.outSeen[job.ID] <= asked {
 			m.outputs[job.ID] = job.Tail
 		}
 	}
 	m.forgetOutputs()
-	m.syncPrompt()
-}
-
-// activeJobs is the set of jobs still in flight.
-func activeJobs(list []jobs.Job) []jobs.Job {
-	var out []jobs.Job
-	for _, job := range list {
-		if !job.State.Terminal() {
-			out = append(out, job)
-		}
-	}
-	return out
 }
 
 func (m *model) mergeJob(job jobs.Job) {
-	replace := func(list []jobs.Job) []jobs.Job {
-		for i := range list {
-			if list[i].ID == job.ID {
-				list[i] = job
-				return list
-			}
-		}
-		return append(list, job)
+	if i := index(m.jobs, func(j jobs.Job) bool { return j.ID == job.ID }); i >= 0 {
+		m.jobs[i] = job
+	} else {
+		m.jobs = append(m.jobs, job)
 	}
-	m.allJobs = replace(m.allJobs)
-	m.forgetOutputs()
-	m.active = activeJobs(m.allJobs)
-
 	switch job.State {
-	case jobs.StateFailed:
-		m.failure = job.Title + ": " + job.Err
 	case jobs.StateSucceeded:
 		m.status = job.Title + " finished"
+	case jobs.StateFailed:
+		m.status = job.Title + " failed"
+	}
+	m.forgetOutputs()
+}
+
+// forgetOutputs drops what is kept about jobs the daemon no longer keeps,
+// then lets the open question follow the jobs.
+func (m *model) forgetOutputs() {
+	gone := func(id string) bool { return index(m.jobs, func(j jobs.Job) bool { return j.ID == id }) < 0 }
+	for id := range m.outputs {
+		if gone(id) {
+			delete(m.outputs, id)
+		}
+	}
+	for _, seen := range []map[string]int{m.jobSeen, m.outSeen} {
+		for id := range seen {
+			if gone(id) {
+				delete(seen, id)
+			}
+		}
 	}
 	m.syncPrompt()
 }
 
-func (m model) current() (daemon.Connection, bool) {
-	if m.cursor < 0 || m.cursor >= len(m.conns) {
-		return daemon.Connection{}, false
-	}
-	return m.conns[m.cursor], true
+// pendingJob is the job a connection is busy with. The daemon lists jobs
+// oldest first and runs a connection's jobs in order, so the first unfinished
+// one is running, waiting for an answer, or next in line.
+func (m model) pendingJob(connID string) (jobs.Job, bool) {
+	return find(m.jobs, func(j jobs.Job) bool { return j.ConnID == connID && !j.State.Terminal() })
 }
 
-// lastJobFor returns the most recent job of a connection, running or not.
-func (m model) lastJobFor(id string) (jobs.Job, bool) {
-	for i := len(m.allJobs) - 1; i >= 0; i-- {
-		if m.allJobs[i].ConnID == id {
-			return m.allJobs[i], true
+// lastJob is the newest job of a connection, finished or not.
+func (m model) lastJob(connID string) (jobs.Job, bool) {
+	for i := len(m.jobs) - 1; i >= 0; i-- {
+		if m.jobs[i].ConnID == connID {
+			return m.jobs[i], true
 		}
 	}
 	return jobs.Job{}, false
 }
 
-// filtered narrows the alias list by the substring typed into the filter.
-func (m model) filtered() []sshconfig.Alias {
-	needle := strings.ToLower(strings.TrimSpace(m.aliasFilter.Value()))
-	if needle == "" {
-		return m.aliases
+func (m model) current() (daemon.Connection, bool) {
+	if m.cursor >= len(m.conns) {
+		return daemon.Connection{}, false
 	}
+	return m.conns[m.cursor], true
+}
+
+func (m model) connByID(id string) (daemon.Connection, bool) {
+	return find(m.conns, func(c daemon.Connection) bool { return c.ID == id })
+}
+
+// filtered narrows the aliases to those whose name or host contains the filter.
+func (m model) filtered() []sshconfig.Alias {
+	needle := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	var out []sshconfig.Alias
 	for _, a := range m.aliases {
 		if strings.Contains(strings.ToLower(a.Name), needle) || strings.Contains(strings.ToLower(a.Host), needle) {
@@ -262,64 +293,28 @@ func (m model) filtered() []sshconfig.Alias {
 	return out
 }
 
-// jobFor reports the job in flight for a connection, so a row can show what is
-// happening to it instead of its stored state.
-func (m model) jobFor(id string) (jobs.Job, bool) {
-	for _, j := range m.active {
-		if j.ConnID == id {
-			return j, true
+func index[T any](items []T, match func(T) bool) int {
+	for i, item := range items {
+		if match(item) {
+			return i
 		}
 	}
-	return jobs.Job{}, false
+	return -1
 }
 
-// rows uses the same footer height as page so paging keeps the cursor visible.
-func (m model) rows() int {
-	if m.height <= 0 {
-		return 10
+func find[T any](items []T, match func(T) bool) (T, bool) {
+	var zero T
+	if i := index(items, match); i >= 0 {
+		return items[i], true
 	}
-	return max(1, m.bodyRows(listHelp))
+	return zero, false
 }
 
-// aliasRows is the picker's window, which also carries the filter line.
-func (m model) aliasRows() int {
-	if m.height <= 0 {
-		return 9
-	}
-	return max(1, m.bodyRows(aliasHelp)-1)
-}
-
-// scroll keeps the cursor inside the visible window.
+// scroll keeps the cursor inside a window of rows starting at offset.
 func scroll(offset, cursor, rows int) int {
-	if cursor < offset {
-		return cursor
-	}
-	if cursor >= offset+rows {
-		return cursor - rows + 1
-	}
-	return offset
-}
-
-// aliasFor reports the ssh alias a target points at, so a row can show where
-// it actually connects.
-func (m model) aliasFor(target string) (sshconfig.Alias, bool) {
-	for _, a := range m.aliases {
-		if a.Name == target {
-			return a, true
-		}
-	}
-	return sshconfig.Alias{}, false
+	return min(max(offset, cursor-rows+1), cursor)
 }
 
 func clamp(i, length int) int {
-	if length == 0 {
-		return 0
-	}
-	if i < 0 {
-		return 0
-	}
-	if i >= length {
-		return length - 1
-	}
-	return i
+	return max(0, min(i, length-1))
 }

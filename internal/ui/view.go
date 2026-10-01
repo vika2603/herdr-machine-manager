@@ -5,408 +5,663 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vika2603/herdr-machine-manager/internal/daemon"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
+	"github.com/vika2603/herdr-machine-manager/internal/sshconfig"
 )
 
-// Colors are ANSI indexes rather than hex, so the popup follows the terminal
-// theme herdr is rendered in.
+// The palette has a variant for dark and for light terminal backgrounds, each
+// readable on its background; Lip Gloss picks the variant and degrades the
+// colour on terminals with fewer colours. Text without a role keeps the
+// terminal's own foreground. One accent marks focus and action; the state
+// colours appear only where a state is shown.
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true)
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	rowStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
-	fieldStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
-)
+	accentColor = lipgloss.AdaptiveColor{Light: "#6A4BE0", Dark: "#A891FF"}
+	badgeColor  = lipgloss.AdaptiveColor{Light: "#6A4BE0", Dark: "#7D56F4"}
+	greenColor  = lipgloss.AdaptiveColor{Light: "#1F7A3A", Dark: "#8FDB9A"}
+	blueColor   = lipgloss.AdaptiveColor{Light: "#1D5FC4", Dark: "#89B4FA"}
+	amberColor  = lipgloss.AdaptiveColor{Light: "#985200", Dark: "#F9B562"}
+	redColor    = lipgloss.AdaptiveColor{Light: "#C02B3C", Dark: "#F38BA8"}
+	greyColor   = lipgloss.AdaptiveColor{Light: "#5E6472", Dark: "#9399B2"}
+	pinkColor   = lipgloss.AdaptiveColor{Light: "#A8307E", Dark: "#F0A6D8"}
+	// Backgrounds of the selected row, of blocks of command output, and of
+	// key caps and unselected buttons.
+	selectedBg = lipgloss.AdaptiveColor{Light: "#ECE7FC", Dark: "#312A4D"}
+	blockBg    = lipgloss.AdaptiveColor{Light: "#EFEFF3", Dark: "#282838"}
+	capBg      = lipgloss.AdaptiveColor{Light: "#ECEAF4", Dark: "#313149"}
+	noBg       = lipgloss.NoColor{}
 
-// defaultCols is used until the first resize message arrives.
-const defaultCols = 72
+	boldStyle   = lipgloss.NewStyle().Bold(true)
+	mutedStyle  = lipgloss.NewStyle().Foreground(greyColor)
+	accentStyle = lipgloss.NewStyle().Foreground(accentColor)
+	greenStyle  = lipgloss.NewStyle().Foreground(greenColor)
+	blueStyle   = lipgloss.NewStyle().Foreground(blueColor)
+	amberStyle  = lipgloss.NewStyle().Foreground(amberColor)
+	redStyle    = lipgloss.NewStyle().Foreground(redColor)
+	badgeStyle  = lipgloss.NewStyle().Background(badgeColor).Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+	capStyle    = lipgloss.NewStyle().Background(capBg).Foreground(accentColor).Bold(true)
+)
 
 const (
-	listHelp  = "Ctrl+A add · Ctrl+E edit · Space toggle · Enter details · Esc close"
-	aliasHelp = "Enter select · Esc back"
+	// wideMin is the narrowest pane that holds the list and the panel side by
+	// side.
+	wideMin = 76
+	// defaultCols and defaultRows apply until the first resize arrives.
+	defaultCols, defaultRows = 100, 26
+	// chromeRows is the header, the space under it, the status line and the
+	// hint line.
+	chromeRows = 4
+	// keyWidth is the column a panel's setting names take.
+	keyWidth = 10
 )
 
-// cols is the width to lay out for. A narrow popup is laid out narrow rather
-// than overflowing it, so rules and rows never wrap.
-func (m model) cols() int {
-	if m.width <= 0 {
-		return defaultCols
-	}
-	return m.width
+// look is how a state appears wherever it is shown: one glyph, one colour and
+// one word.
+type look struct {
+	glyph, word string
+	style       lipgloss.Style
 }
 
-// page lays out every screen the same way: a header with a right-aligned
-// summary, a rule, the body, and a bottom-aligned footer. Status messages sit
-// above the footer rule so the key hints always occupy the last row.
-func (m model) page(title, summary string, body []string, help string) string {
+func (l look) String() string { return l.style.Render(l.glyph + " " + l.word) }
+
+var (
+	lookConnected    = look{"●", "connected", greenStyle}
+	lookDisconnected = look{"○", "disconnected", mutedStyle}
+	lookAsking       = look{"◆", "needs answer", amberStyle}
+	progressWords    = map[jobs.Kind]string{jobs.KindConnect: "connecting…", jobs.KindDisconnect: "disconnecting…", jobs.KindRename: "renaming…", jobs.KindForget: "forgetting…"}
+)
+
+func jobLook(job jobs.Job) look {
+	kind := string(job.Kind)
+	switch job.State {
+	case jobs.StateQueued:
+		return look{"◌", kind + " queued", blueStyle}
+	case jobs.StateAwaitingInput:
+		return lookAsking
+	case jobs.StateSucceeded:
+		return look{"✓", kind + " succeeded", greenStyle}
+	case jobs.StateFailed:
+		return look{"✕", kind + " failed", redStyle}
+	case jobs.StateCancelled:
+		return look{"⊘", kind + " cancelled", mutedStyle}
+	}
+	return look{"◐", or(progressWords[job.Kind], kind+"…"), blueStyle}
+}
+
+// connLook is the state a connection shows: a job in flight wins over the
+// stored state, and a failure stays until the next job replaces it, together
+// with its error.
+func (m model) connLook(c daemon.Connection) (look, string) {
+	if job, ok := m.pendingJob(c.ID); ok {
+		return jobLook(job), ""
+	}
+	if job, ok := m.lastJob(c.ID); ok && job.State == jobs.StateFailed {
+		return jobLook(job), job.Err
+	}
+	if c.Active {
+		return lookConnected, ""
+	}
+	return lookDisconnected, ""
+}
+
+func (m model) cols() int     { return or(m.width, defaultCols) }
+func (m model) rows() int     { return or(m.height, defaultRows) }
+func (m model) wide() bool    { return m.cols() >= wideMin }
+func (m model) bodyRows() int { return max(1, m.rows()-chromeRows) }
+
+// panelRows is the rows inside the panel's border, which a body shorter than
+// three rows has no room for.
+func (m model) panelRows() int {
+	if rows := m.bodyRows(); rows >= 3 {
+		return rows - 2
+	}
+	return m.bodyRows()
+}
+
+func (m model) aliasRows() int { return max(1, m.panelRows()-3) }
+
+// listWidth and panelWidth exclude the margins and the gap between them.
+func (m model) listWidth() int {
+	if !m.wide() {
+		return m.cols() - 2
+	}
+	return min(44, m.cols()*2/5)
+}
+
+func (m model) panelWidth() int {
+	if !m.wide() {
+		return m.cols() - 2
+	}
+	return m.cols() - m.listWidth() - 4
+}
+
+type hint struct{ key, action string }
+
+// frame lays out every screen the same way: a header with the title badge and
+// the counts, the body, a status line, and one line of key hints. Without the
+// alternate screen a taller frame would scroll its own top away, so the frame
+// is exactly the pane's size and no line is wider than it.
+func (m model) frame(title string, summary []string, left, right []string, hints []hint) string {
 	w := m.cols()
-	rule := dimStyle.Render(strings.Repeat("─", w))
-
-	head := titleStyle.Render(title)
-	if summary != "" {
-		head = head + strings.Repeat(" ", max(1, w-lipgloss.Width(head)-lipgloss.Width(summary))) + dimStyle.Render(summary)
+	head := " " + badgeStyle.Render(" "+title+" ")
+	for _, part := range summary {
+		if lipgloss.Width(head)+2+lipgloss.Width(part) > w-1 {
+			break
+		}
+		head += "  " + part
 	}
-
-	footer := m.footer()
-	helpLines := m.helpLines(help)
-
-	// The popup is a fixed number of rows and the program does not use the
-	// alternate screen, so a frame taller than the pane would scroll the top
-	// of it away. The body is cut to what is left after the chrome.
-	if m.height > 0 {
-		room := m.bodyRows(help)
-		visibleBody := make([]string, room)
-		copy(visibleBody, body)
-		body = visibleBody
+	out := []string{head, ""}
+	for i := range m.bodyRows() {
+		line := " " + at(left, i)
+		if right != nil {
+			line = " " + fit(at(left, i), m.listWidth()) + "  " + at(right, i)
+		}
+		out = append(out, line)
 	}
-
-	out := []string{head, rule}
-	out = append(out, body...)
-	if footer != "" {
-		out = append(out, footer)
+	note := mutedStyle.Render(m.status)
+	if err := or(m.failure, or(m.link, m.config)); err != "" {
+		note = redStyle.Render("✕ " + oneLine(err))
 	}
-	out = append(out, rule)
-	for _, line := range helpLines {
-		out = append(out, dimStyle.Render(line))
+	out = append(out, " "+ansi.Truncate(note, max(0, w-2), "…"), hintLine(hints, w))
+	for i := range out {
+		out[i] = ansi.Truncate(out[i], w, "")
 	}
-	if m.height > 0 && len(out) > m.height {
-		out = out[len(out)-m.height:]
-	}
-	return strings.Join(out, "\n")
+	return strings.Join(out[max(0, len(out)-m.rows()):], "\n")
 }
 
-// Keep the footer to one quiet line. Drop secondary hints first in narrow
-// panes, retaining the primary action and the way back for as long as they fit.
-func (m model) helpLines(help string) []string {
-	hints := strings.Split(help, " · ")
-	for len(hints) > 1 && lipgloss.Width(strings.Join(hints, " · ")) > m.cols() {
-		i := len(hints) - 2
-		hints = append(hints[:i], hints[i+1:]...)
+// hintLine drops hints from the end, keeping the last, until the line fits:
+// hints are listed most important first, and the way out last.
+func hintLine(hints []hint, w int) string {
+	for {
+		parts := make([]string, len(hints))
+		for i, h := range hints {
+			parts[i] = capStyle.Render(" "+h.key+" ") + " " + mutedStyle.Render(h.action)
+		}
+		line := " " + strings.Join(parts, "  ")
+		if len(hints) <= 1 || lipgloss.Width(line) <= w {
+			return line
+		}
+		hints = append(hints[:len(hints)-2:len(hints)-2], hints[len(hints)-1])
 	}
-	return []string{lipgloss.NewStyle().MaxWidth(m.cols()).Render(strings.Join(hints, " · "))}
 }
 
-func (m model) bodyRows(help string) int {
-	chrome := 3 + len(m.helpLines(help)) // header and two rules
-	if m.footer() != "" {
-		chrome++
+// box frames what fill draws in a rounded border of colour, with the title
+// set into the top edge, w columns by h rows. Below three rows there is no
+// room for a border and fill draws on its own.
+func box(w, h int, colour lipgloss.TerminalColor, fill func(w, rows int) (string, []string)) []string {
+	if h < 3 {
+		_, lines := fill(w, h)
+		return lines
 	}
-	return max(0, m.height-chrome)
+	title, lines := fill(w-4, h-2)
+	edge := lipgloss.NewStyle().Foreground(colour)
+	title = ansi.Truncate(title, max(0, w-6), "…")
+	top := edge.Render("╭" + strings.Repeat("─", w-2) + "╮")
+	if title != "" {
+		top = edge.Render("╭─ ") + edge.Bold(true).Render(title) + edge.Render(" "+strings.Repeat("─", max(0, w-5-lipgloss.Width(title)))+"╮")
+	}
+	out := []string{top}
+	for i := range h - 2 {
+		out = append(out, edge.Render("│")+" "+fit(at(lines, i), w-4)+" "+edge.Render("│"))
+	}
+	return append(out, edge.Render("╰"+strings.Repeat("─", w-2)+"╯"))
+}
+
+// cell is plain text in a style; row draws cells on one background.
+type cell struct {
+	text  string
+	style lipgloss.Style
+}
+
+// row renders cells side by side on bg and pads them to w columns. Each cell
+// carries the background itself: a styled string nested in another would
+// reset it.
+func row(cells []cell, w int, bg lipgloss.TerminalColor) string {
+	var b strings.Builder
+	used := 0
+	for _, c := range cells {
+		text := ansi.Truncate(c.text, max(0, w-used), "…")
+		used += lipgloss.Width(text)
+		b.WriteString(c.style.Background(bg).Render(text))
+	}
+	b.WriteString(lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", max(0, w-used))))
+	return b.String()
+}
+
+// selection is the bar, background and label style of a row, which mark the
+// selected one.
+func selection(selected bool) (cell, lipgloss.TerminalColor, lipgloss.Style) {
+	if selected {
+		return cell{"▌ ", accentStyle}, selectedBg, boldStyle
+	}
+	return cell{"  ", lipgloss.NewStyle()}, noBg, lipgloss.NewStyle()
 }
 
 func (m model) View() string {
-	base := m.viewScreen()
-	if m.dialog != nil {
-		return m.viewPrompt(base)
+	pw, rows := m.panelWidth(), m.bodyRows()
+	conn, selected := m.current()
+	var panel []string
+	switch {
+	case m.dialog != nil:
+		panel = box(pw, rows, promptColour(m.dialog.info.Kind), m.promptLines)
+	case m.mode == modePick:
+		panel = box(pw, rows, accentColor, m.pickLines)
+	case m.mode == modeForm:
+		panel = box(pw, rows, accentColor, m.formLines)
+	case m.mode == modeForget:
+		panel = box(pw, rows, accentColor, m.forgetLines)
+	case selected && (m.wide() || m.mode == modeDetail):
+		l, _ := m.connLook(conn)
+		panel = box(pw, rows, l.style.GetForeground(), func(w, rows int) (string, []string) { return conn.Label, m.detailLines(conn, w, rows) })
+	case m.wide():
+		panel = []string{}
 	}
-	return base
+	if !m.wide() && panel != nil {
+		return m.frame("Machines", m.summary(), panel, nil, m.hints())
+	}
+	return m.frame("Machines", m.summary(), m.listLines(), panel, m.hints())
 }
 
-func (m model) viewScreen() string {
-	switch m.screen {
-	case screenAliases:
-		return m.viewAliases()
-	case screenForm:
-		return m.viewForm()
-	case screenConfirm:
-		return m.viewConfirm()
-	case screenOutput:
-		return m.viewOutput()
-	default:
-		return m.viewList()
-	}
-}
-
-func (m model) viewList() string {
-	m.offset = scroll(m.offset, m.cursor, m.rows())
-	var body []string
-	if len(m.conns) == 0 {
-		body = append(body, "", dimStyle.Render("  no connections yet"),
-			dimStyle.Render("  press Ctrl+A to add one from ~/.ssh/config"))
-	}
-	for i, conn := range visible(m.conns, m.offset, m.rows()) {
-		body = append(body, m.connRow(m.offset+i, conn))
-	}
-	return m.page("SSH connections", m.counts(), body, listHelp)
-}
-
-// connRow shows the stored connection and, when something is happening to it,
-// what that is. The state of a command lives on the row it belongs to.
-func (m model) connRow(i int, conn daemon.Connection) string {
-	state, detail := m.connState(conn)
-
-	target := conn.Target
-	if alias, ok := m.aliasFor(conn.Target); ok && alias.Host != "" {
-		target = conn.Target + dimStyle.Render(" → "+endpoint(alias.User, alias.Host, alias.Port))
-	}
-	if detail == "" {
-		detail = target
-		if conn.Session != "" {
-			detail += dimStyle.Render("  session: " + conn.Session)
+// summary counts the connections by state, each count in its state's colour.
+// The header drops counts from the end when it runs out of room.
+func (m model) summary() []string {
+	active, failed, busy := 0, 0, 0
+	for _, c := range m.conns {
+		l, _ := m.connLook(c)
+		switch l.glyph {
+		case "✕":
+			failed++
+		case "◐", "◌":
+			busy++
 		}
-	}
-
-	row := fmt.Sprintf(" %s %s  %s", state, pad(conn.Label, 16), detail)
-	if i == m.cursor {
-		return rowStyle.Render("❯") + row
-	}
-	return " " + row
-}
-
-// connState reports the marker and the trailing text for a connection: a job
-// in flight wins over the stored state, and a failure stays visible until the
-// next job replaces it.
-func (m model) connState(conn daemon.Connection) (marker, detail string) {
-	if job, ok := m.jobFor(conn.ID); ok {
-		switch job.State {
-		case jobs.StateAwaitingInput:
-			return errStyle.Render("!"), warnStyle.Render("needs an answer — press enter")
-		case jobs.StateQueued:
-			return warnStyle.Render("⟳"), dimStyle.Render(progressWord(job.Kind) + " · queued")
-		default:
-			return warnStyle.Render("⟳"), warnStyle.Render(progressWord(job.Kind) + "…")
-		}
-	}
-	if job, ok := m.lastJobFor(conn.ID); ok && job.State == jobs.StateFailed {
-		return errStyle.Render("✕"), errStyle.Render(truncate(job.Err, max(20, m.cols()-28)))
-	}
-	if conn.Active {
-		return okStyle.Render("●"), ""
-	}
-	return dimStyle.Render("○"), ""
-}
-
-func progressWord(kind jobs.Kind) string {
-	switch kind {
-	case jobs.KindConnect:
-		return "connecting"
-	case jobs.KindDisconnect:
-		return "disconnecting"
-	case jobs.KindForget:
-		return "removing"
-	case jobs.KindRename:
-		return "renaming"
-	}
-	return string(kind)
-}
-
-func (m model) counts() string {
-	active := 0
-	for _, conn := range m.conns {
-		if conn.Active {
+		if c.Active {
 			active++
 		}
 	}
-	parts := []string{fmt.Sprintf("%d connected", active)}
-	if off := len(m.conns) - active; off > 0 {
-		parts = append(parts, fmt.Sprintf("%d off", off))
+	parts := []string{count(greenStyle, "●", fmt.Sprintf("%d of %d", active, len(m.conns)), "connected")}
+	if n := len(m.waiting()); n > 0 {
+		parts = append(parts, count(amberStyle, "◆", fmt.Sprint(n), "needs answer"))
 	}
-	if n := len(m.active); n > 0 {
-		parts = append(parts, fmt.Sprintf("%d working", n))
+	if failed > 0 {
+		parts = append(parts, count(redStyle, "✕", fmt.Sprint(failed), "failed"))
 	}
-	return strings.Join(parts, " · ")
+	if busy > 0 {
+		parts = append(parts, count(blueStyle, "◐", fmt.Sprint(busy), "busy"))
+	}
+	return parts
 }
 
-func (m model) viewAliases() string {
-	list := m.filtered()
-	m.aliasOffset = scroll(m.aliasOffset, m.aliasCursor, m.aliasRows())
-	body := []string{" " + accentStyle.Render("filter") + " " + m.aliasFilter.View()}
-
-	if len(list) == 0 {
-		body = append(body, dimStyle.Render("  nothing matches in ~/.ssh/config"))
-	}
-	for i, alias := range visible(list, m.aliasOffset, m.aliasRows()) {
-		index := m.aliasOffset + i
-		detail := dimStyle.Render(endpoint(alias.User, alias.Host, alias.Port))
-		if m.savedTarget(alias.Name) {
-			detail += "  " + okStyle.Render("added")
-		}
-		row := fmt.Sprintf(" %s  %s", pad(alias.Name, 18), detail)
-		if index == m.aliasCursor {
-			body = append(body, rowStyle.Render("❯")+row)
-		} else {
-			body = append(body, " "+row)
-		}
-	}
-
-	summary := fmt.Sprintf("%d of %d aliases", len(list), len(m.aliases))
-	return m.page("Add a connection — pick an alias", summary, body, aliasHelp)
+func count(style lipgloss.Style, glyph, n, word string) string {
+	return style.Render(glyph+" "+n) + " " + mutedStyle.Render(word)
 }
 
-func (m model) savedTarget(name string) bool {
-	for _, conn := range m.conns {
-		if conn.Target == name {
-			return true
-		}
+func (m model) hints() []hint {
+	switch {
+	case m.dialog != nil && m.dialog.info.Kind == jobs.PromptConfirm:
+		return []hint{{"←→", "choose"}, {"enter", "send"}, {"esc", "later"}}
+	case m.dialog != nil:
+		return []hint{{"enter", "send"}, {"esc", "later"}}
+	case m.typing():
+		return m.typingHints()
+	case m.mode == modeForget:
+		return []hint{{"enter", "forget"}, {"esc", "keep"}}
 	}
-	return false
-}
-
-func (m model) viewForm() string {
-	field := func(i int, name string, input string) string {
-		marker, label := "  ", fieldStyle.Render(pad(name, 11))
-		if i == m.field {
-			marker, label = rowStyle.Render("❯ "), accentStyle.Render(pad(name, 11))
-		}
-		return marker + label + input
+	back := hint{"esc", "close"}
+	if m.mode == modeDetail {
+		back.action = "back"
 	}
-
-	box := "[ ]"
-	if m.install {
-		box = okStyle.Render("[×]")
-	}
-
-	body := []string{
-		field(0, "Label", m.label.View()),
-		field(1, "SSH target", m.target.View()),
-		field(2, "Session", m.session.View()),
-		field(3, "", box+" allow remote herdr install (asks first)"),
-		"",
-		dimStyle.Render("  $ " + truncate(strings.Join(m.previewArgs(), " "), m.cols()-4)),
-		dimStyle.Render("  runs in background; questions open a small popup"),
-	}
-
-	title, summary := "Add a connection", ""
-	if m.editing != "" {
-		title = "Edit connection"
-		if conn, ok := m.current(); ok && conn.Active && conn.Target != strings.TrimSpace(m.target.Value()) {
-			summary = "target changed — will reconnect"
-		}
-	}
-	return m.page(title, summary, body, "Enter save · Tab field · Esc back")
-}
-
-// previewArgs shows the command the daemon will run, so the form is not a
-// black box over herdr's own CLI.
-func (m model) previewArgs() []string {
-	label := strings.TrimSpace(m.label.Value())
-	target := strings.TrimSpace(m.target.Value())
-	if target == "" {
-		target = "<ssh-target>"
-	}
-	if label == "" {
-		label = "<label>"
-	}
-	args := []string{"herdr", "machine", "add", target, "--label", label}
-	if session := strings.TrimSpace(m.session.Value()); session != "" {
-		args = append(args, "--remote-session", session)
-	}
-	return args
-}
-
-func (m model) viewConfirm() string {
-	if m.confirm == nil {
-		return ""
-	}
-	note := "  it is not connected, so this only drops it here"
-	if m.confirm.Active {
-		note = "  it is removed from herdr too; sessions already running keep running"
-	}
-	body := []string{
-		"",
-		"  forget " + titleStyle.Render(m.confirm.Label) + dimStyle.Render("  ("+m.confirm.Target+")") + "?",
-		"",
-		dimStyle.Render(note),
-	}
-	return m.page("Forget a connection", "", body, "Enter forget · Esc cancel")
-}
-
-// viewOutput always shows the saved connection settings, with task output below
-// them when available.
-func (m model) viewOutput() string {
 	conn, ok := m.current()
 	if !ok {
-		return m.viewList()
+		return []hint{{"a", "add"}, back}
 	}
-	field := func(name, value string) string {
-		return "  " + dimStyle.Render(pad(name, 11)) + value
+	var hs []hint
+	job, busy := m.pendingJob(conn.ID)
+	if busy && job.State == jobs.StateAwaitingInput {
+		hs = append(hs, hint{"enter", "answer"})
+	} else if !m.wide() && m.mode == modeList {
+		hs = append(hs, hint{"enter", "details"})
 	}
-	session := conn.Session
-	if session == "" {
-		session = dimStyle.Render("(default)")
+	if busy {
+		hs = append(hs, hint{"x", "cancel job"})
+	} else {
+		hs = append(hs, hint{"space", map[bool]string{true: "disconnect", false: "connect"}[conn.Active]})
 	}
-	state := dimStyle.Render("disconnected")
-	if conn.Active {
-		state = okStyle.Render("connected")
+	return append(hs, hint{"a", "add"}, hint{"e", "edit"}, hint{"d", "forget"}, hint{"r", "refresh"}, back)
+}
+
+// typingHints puts the waiting question right after the primary action, so a
+// narrow hint line keeps it.
+func (m model) typingHints() []hint {
+	hs := []hint{{"enter", "save"}}
+	if m.mode == modePick {
+		hs[0].action = map[bool]string{true: "choose", false: "add as typed"}[len(m.filtered()) > 0]
 	}
-	body := []string{
-		field("Label", conn.Label),
-		field("SSH target", conn.Target),
-		field("Session", session),
-		field("State", state),
+	if len(m.waiting()) > 0 {
+		hs = append(hs, hint{"ctrl+o", "answer"})
 	}
-	if alias, found := m.aliasFor(conn.Target); found && alias.Host != "" {
-		body = append(body, field("Address", endpoint(alias.User, alias.Host, alias.Port)))
+	if m.mode == modeForm {
+		hs = append(hs, hint{"tab", "next field"})
 	}
-	help := "Ctrl+E edit · Esc back"
-	job, hasJob := m.lastJobFor(conn.ID)
+	if m.mode == modeForm && m.field == 3 {
+		hs = append(hs, hint{"space", "switch"})
+	}
+	return append(hs, hint{"esc", "cancel"})
+}
+
+// listLines is one row per connection: the selection bar, the state glyph,
+// the label and the state word in aligned columns, then the error or the
+// target as room allows.
+func (m model) listLines() []string {
+	if len(m.conns) == 0 {
+		return []string{"", mutedStyle.Render(" No connections yet."), mutedStyle.Render(" Press a to add one from ~/.ssh/config.")}
+	}
+	w := m.listWidth()
+	m.offset = scroll(m.offset, m.cursor, m.bodyRows())
+	shown := m.conns[m.offset:min(m.offset+m.bodyRows(), len(m.conns))]
+	labelW, wordW := 0, 0
+	for _, c := range shown {
+		l, _ := m.connLook(c)
+		labelW, wordW = max(labelW, lipgloss.Width(c.Label)), max(wordW, lipgloss.Width(l.word))
+	}
+	labelW = min(labelW, 22, max(4, w-6-wordW))
+
+	var out []string
+	for i, c := range shown {
+		l, failure := m.connLook(c)
+		bar, bg, labelStyle := selection(m.offset+i == m.cursor)
+		cells := []cell{bar, {l.glyph + " ", l.style}, {fit(c.Label, labelW) + "  ", labelStyle}, {fit(l.word, wordW), l.style}}
+		if room := w - labelW - wordW - 8; room >= 6 && failure != "" {
+			cells = append(cells, cell{"  " + fit(oneLine(failure), room), redStyle})
+		} else if room >= 6 {
+			cells = append(cells, cell{"  " + fit(c.Target, room), mutedStyle})
+		}
+		out = append(out, row(cells, w, bg))
+	}
+	return out
+}
+
+func setting(name, value string, w int) string {
+	return mutedStyle.Render(fit(name, keyWidth)) + ansi.Truncate(value, max(0, w-keyWidth), "…")
+}
+
+// block is text set apart on its own background, as command output is.
+func block(lines []string, w int, style lipgloss.Style) []string {
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		out[i] = row([]cell{{" " + line, style}}, w, blockBg)
+	}
+	return out
+}
+
+// detailLines is the selected connection's panel: its state with the error or
+// question behind it, its settings, then the latest job's output as far as it
+// fits.
+func (m model) detailLines(c daemon.Connection, w, rows int) []string {
+	l, failure := m.connLook(c)
+	lines := []string{l.style.Bold(true).Render(l.glyph + " " + l.word)}
+	for _, line := range limit(wrap(failure, w-2), 3) {
+		lines = append(lines, "  "+redStyle.Render(line))
+	}
+	// The panel follows the job the state line shows: one queued behind it
+	// has neither output nor a question yet.
+	job, hasJob := m.pendingJob(c.ID)
 	if !hasJob {
-		return m.page("Connection details", "", body, help)
+		job, hasJob = m.lastJob(c.ID)
 	}
-	if !job.State.Terminal() {
-		help = "Ctrl+E edit · Ctrl+X cancel job · Esc back"
+	if hasJob && job.State == jobs.StateAwaitingInput {
+		lines = append(lines, "  "+amberStyle.Render(ansi.Truncate(oneLine(job.Prompt), w-2, "…")))
 	}
-	if job.State == jobs.StateAwaitingInput {
-		help = "Enter answer · Ctrl+E edit · Esc back"
+	lines = append(lines, "", setting("Target", c.Target, w))
+	if alias, ok := find(m.aliases, func(a sshconfig.Alias) bool { return a.Name == c.Target }); ok && alias.Host != "" {
+		lines = append(lines, setting("Address", endpoint(alias.User, alias.Host, alias.Port), w))
 	}
-	body = append(body, "", field("Task", stateLabel(job)))
-	var prompt []string
-	if job.State == jobs.StateAwaitingInput {
-		prompt = []string{"  " + warnStyle.Render(job.Prompt), dimStyle.Render("  Press Enter to answer")}
+	lines = append(lines, setting("Session", or(c.Session, mutedStyle.Render("default")), w))
+	if !hasJob {
+		return squeeze(lines, rows)
 	}
-	rows := outputTail
-	if m.height > 0 {
-		// Reserve the answer prompt before allocating space to settings and
-		// logs, so a short pane can still answer an interactive job.
-		room := max(0, m.bodyRows(help)-len(prompt))
-		body = body[:min(len(body), room)]
-		rows = room - len(body)
+	// The state line already shows a job that is unfinished or failed.
+	if job.State == jobs.StateSucceeded || job.State == jobs.StateCancelled {
+		lines = append(lines, setting("Last job", jobLook(job).String(), w))
 	}
-	for _, line := range m.tail(job, rows) {
-		body = append(body, dimStyle.Render("  "+truncate(line, m.cols()-4)))
+	if output, room := m.outputs[job.ID], rows-len(lines)-2; room > 0 && len(output) > 0 {
+		lines = append(lines, "", mutedStyle.Render("Output"))
+		var tail []string
+		for _, line := range output[max(0, len(output)-room):] {
+			tail = append(tail, oneLine(line))
+		}
+		lines = append(lines, block(tail, w, lipgloss.NewStyle())...)
 	}
-	body = append(body, prompt...)
-	return m.page("Connection details", "", body, help)
+	return squeeze(lines, rows)
 }
 
-// tail is the output buffered for a job: the lines streamed while the popup
-// was open, seeded from the daemon's own copy when the list was read.
-func (m model) tail(job jobs.Job, rows int) []string {
-	lines := m.outputs[job.ID]
-	if len(lines) > rows {
-		lines = lines[len(lines)-rows:]
+func (m model) pickLines(w, rows int) (string, []string) {
+	list, filter := m.filtered(), m.filter
+	filter.Width = max(1, w-keyWidth-1)
+	lines := []string{
+		accentStyle.Render(fit("Filter", keyWidth)) + filter.View(),
+		mutedStyle.Render(fmt.Sprintf("%d of %d aliases", len(list), len(m.aliases))),
+		"",
 	}
-	return lines
+	title := "Add a connection"
+	if typed := strings.TrimSpace(m.filter.Value()); len(list) == 0 && typed != "" {
+		return title, squeeze(append(lines, wrap("No alias in ~/.ssh/config matches. Press enter to add "+typed+" as the ssh target and label.", w)...), rows)
+	} else if len(list) == 0 {
+		return title, squeeze(append(lines, wrap("No alias in ~/.ssh/config. Press enter to type a target.", w)...), rows)
+	}
+	nameW := 0
+	for _, a := range list {
+		nameW = max(nameW, lipgloss.Width(a.Name))
+	}
+	nameW = min(nameW, 24, w/2)
+	offset := max(0, m.aliasCursor-m.aliasRows()+1)
+	for i := offset; i < min(offset+m.aliasRows(), len(list)); i++ {
+		a := list[i]
+		bar, bg, nameStyle := selection(i == m.aliasCursor)
+		cells := []cell{bar, {fit(a.Name, nameW) + "  ", nameStyle}}
+		addr := endpoint(a.User, a.Host, a.Port)
+		if index(m.conns, func(c daemon.Connection) bool { return c.Target == a.Name }) >= 0 {
+			cells = append(cells, cell{fit(addr, max(0, w-nameW-11)), mutedStyle}, cell{"  added", greenStyle})
+		} else {
+			cells = append(cells, cell{addr, mutedStyle})
+		}
+		lines = append(lines, row(cells, w, bg))
+	}
+	// In a pane too short for the whole panel the selected alias, which is
+	// last in the window, outlasts the filter.
+	return title, lines[max(0, len(lines)-rows):]
 }
 
-func (m model) footer() string {
-	switch {
-	case m.failure != "":
-		return errStyle.Render("! " + truncate(m.failure, m.cols()-2))
-	case m.status != "":
-		return dimStyle.Render("  " + truncate(m.status, m.cols()-2))
+func (m model) formLines(w, rows int) (string, []string) {
+	var lines []string
+	for i, name := range []string{"Label", "Target", "Session", "Install"} {
+		mark, key := "  ", mutedStyle.Render(fit(name, keyWidth-2))
+		if i == m.field {
+			mark, key = accentStyle.Render("▌ "), accentStyle.Bold(true).Render(fit(name, keyWidth-2))
+		}
+		value := mutedStyle.Render("[ ]") + " allow installing herdr on the remote"
+		if m.install {
+			value = accentStyle.Bold(true).Render("[✓]") + " allow installing herdr on the remote"
+		}
+		if i < 3 {
+			in := m.fields[i]
+			in.Width = max(1, w-keyWidth-1)
+			value = in.View()
+		}
+		lines = append(lines, mark+key+ansi.Truncate(value, max(0, w-keyWidth), "…"))
+	}
+	lines = append(lines, "")
+	if conn, ok := m.reconnects(); ok {
+		lines = append(lines, redStyle.Render("!")+" Saving reconnects "+conn.Label+".")
+	}
+	p := m.formParams()
+	command := "$ herdr machine add " + or(p.Target, "<target>") + " --label " + or(p.Label, "<label>")
+	if p.Session != "" {
+		command += " --remote-session " + p.Session
+	}
+	lines = append(lines, block(limit(wrap(command, w-1), 2), w, mutedStyle)...)
+	return map[bool]string{true: "New connection", false: "Edit connection"}[m.editing == ""], squeeze(lines, rows)
+}
+
+func (m model) forgetLines(w, rows int) (string, []string) {
+	conn, _ := m.connByID(m.forget)
+	note := "It is not connected, so only its saved settings here are removed."
+	if conn.Active {
+		note = "It is connected, so it is also removed from herdr. Sessions already running on that host keep running."
+	}
+	lines := []string{setting("Target", conn.Target, w), ""}
+	return "Forget " + conn.Label + "?", squeeze(append(lines, wrap(note, w)...), rows)
+}
+
+// promptColour is the accent of a question's card, which follows the kind of
+// answer it wants.
+func promptColour(kind jobs.PromptKind) lipgloss.TerminalColor {
+	switch kind {
+	case jobs.PromptConfirm:
+		return amberColor
+	case jobs.PromptSecret:
+		return pinkColor
+	}
+	return accentColor
+}
+
+// promptLines is the waiting question: whose it is, what kind of answer it
+// wants, as much of the question as fits, and the answer control, which is
+// never cut.
+func (m model) promptLines(w, rows int) (string, []string) {
+	d := m.dialog
+	kindStyle := lipgloss.NewStyle().Foreground(promptColour(d.info.Kind))
+	who, target := d.jobID, ""
+	if conn, ok := m.connByID(d.connID); ok {
+		who, target = conn.Label, conn.Target+" · "
+	}
+	kind := map[jobs.PromptKind]string{jobs.PromptConfirm: "confirmation", jobs.PromptSecret: "password"}[d.info.Kind]
+	head := []string{mutedStyle.Render(ansi.Truncate(target, max(0, w-14), "…")) + kindStyle.Render("◆ "+or(kind, "text")), ""}
+
+	control := button("No", !d.yes) + "  " + button("Yes", d.yes)
+	if d.info.Kind != jobs.PromptConfirm {
+		in := d.input
+		in.Width, in.EchoCharacter = max(1, w-3), '•'
+		control = kindStyle.Bold(true).Render("› ") + in.View()
+	}
+	keep := []string{control}
+	if d.sending {
+		keep = append(keep, mutedStyle.Render("sending…"))
+	} else if d.failure != "" {
+		keep = append(keep, redStyle.Render(fit(oneLine(d.failure), w)))
+	}
+	if rows <= len(keep) {
+		return who, limit(keep, rows)
+	}
+
+	// Blank separators give way first, so the question may use their rows;
+	// its end, where the question is, is what stays.
+	question := wrap(strings.TrimSpace(ansi.Strip(d.prompt)), w)
+	question = question[max(0, len(question)-max(1, rows-len(keep)-nonBlank(head))):]
+	top := squeeze(append(head, question...), rows-len(keep))
+	return who, squeeze(append(append(top, ""), keep...), rows)
+}
+
+// button marks the selected choice with a pointer as well as the fill, so the
+// choice still shows on a terminal without colour.
+func button(label string, selected bool) string {
+	if selected {
+		return badgeStyle.Render(" ▸ " + label + "  ")
+	}
+	return lipgloss.NewStyle().Background(capBg).Foreground(greyColor).Render("   " + label + "  ")
+}
+
+// View of the standalone prompt pane: the question alone, in the same frame.
+func (m promptModel) View() string {
+	body := []string{mutedStyle.Render("Loading the question…")}
+	if m.dialog != nil {
+		body = box(m.cols()-2, m.bodyRows(), promptColour(m.dialog.info.Kind), m.promptLines)
+	} else if err := or(m.failure, or(m.link, m.config)); err != "" {
+		body = wrap(err, m.cols()-2)
+	}
+	var summary []string
+	if n := len(m.waiting()); n > 1 {
+		summary = []string{count(amberStyle, "◆", fmt.Sprint(n), "questions waiting")}
+	}
+	m.status = ""
+	return m.frame("SSH input", summary, body, nil, m.hints())
+}
+
+func (m promptModel) hints() []hint {
+	if m.dialog == nil {
+		return []hint{{"esc", "close"}}
+	}
+	return m.model.hints()
+}
+
+// squeeze fits lines into rows, dropping blank separators from the bottom up
+// before cutting the last lines.
+func squeeze(lines []string, rows int) []string {
+	for i := len(lines) - 1; i >= 0 && len(lines) > rows; i-- {
+		if lines[i] == "" {
+			lines = append(lines[:i], lines[i+1:]...)
+		}
+	}
+	return limit(lines, rows)
+}
+
+func nonBlank(lines []string) int {
+	n := 0
+	for _, line := range lines {
+		if line != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func limit(lines []string, n int) []string { return lines[:max(0, min(len(lines), n))] }
+
+// wrap breaks text at spaces only, so options such as --remote-session stay
+// whole, and hard-wraps a word longer than the line.
+func wrap(s string, w int) []string {
+	var lines []string
+	line := ""
+	for _, word := range strings.Fields(s) {
+		if line != "" && lipgloss.Width(line)+1+lipgloss.Width(word) > w {
+			lines, line = append(lines, line), ""
+		}
+		line = strings.TrimPrefix(line+" "+word, " ")
+		if lipgloss.Width(line) > w {
+			parts := strings.Split(ansi.Hardwrap(line, max(1, w), false), "\n")
+			lines, line = append(lines, parts[:len(parts)-1]...), parts[len(parts)-1]
+		}
+	}
+	if line == "" {
+		return lines
+	}
+	return append(lines, line)
+}
+
+// oneLine flattens command output and errors, which may carry control
+// sequences and line breaks, into one row of plain text.
+func oneLine(s string) string { return strings.Join(strings.Fields(ansi.Strip(s)), " ") }
+
+// fit truncates or pads s to exactly w columns.
+func fit(s string, w int) string {
+	s = ansi.Truncate(s, max(0, w), "…")
+	return s + strings.Repeat(" ", max(0, w-lipgloss.Width(s)))
+}
+
+func at(lines []string, i int) string {
+	if i < len(lines) {
+		return lines[i]
 	}
 	return ""
 }
 
-func stateLabel(job jobs.Job) string {
-	switch job.State {
-	case jobs.StateSucceeded:
-		return okStyle.Render("succeeded")
-	case jobs.StateFailed:
-		return errStyle.Render("failed: " + truncate(job.Err, 40))
-	case jobs.StateAwaitingInput:
-		return warnStyle.Render("awaiting input")
-	case jobs.StateCancelled:
-		return dimStyle.Render("cancelled")
-	default:
-		return warnStyle.Render(progressWord(job.Kind) + "…")
+func or[T comparable](v, fallback T) T {
+	var zero T
+	if v == zero {
+		return fallback
 	}
+	return v
 }
 
 func endpoint(user, host, port string) string {
@@ -420,35 +675,4 @@ func endpoint(user, host, port string) string {
 		host += ":" + port
 	}
 	return host
-}
-
-// visible returns the window of a list that fits on screen.
-func visible[T any](items []T, offset, rows int) []T {
-	if rows <= 0 || offset >= len(items) {
-		return nil
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	end := min(offset+rows, len(items))
-	return items[offset:end]
-}
-
-func pad(s string, width int) string {
-	s = truncate(s, width)
-	if gap := width - lipgloss.Width(s); gap > 0 {
-		return s + strings.Repeat(" ", gap)
-	}
-	return s
-}
-
-func truncate(s string, width int) string {
-	if width <= 1 || lipgloss.Width(s) <= width {
-		return s
-	}
-	runes := []rune(s)
-	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > width {
-		runes = runes[:len(runes)-1]
-	}
-	return string(runes) + "…"
 }

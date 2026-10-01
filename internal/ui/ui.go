@@ -43,10 +43,9 @@ func run(ctx context.Context, env *plugin.Env, promptOnly bool) error {
 
 	cfg, cfgErr := config.Load(env.ConfigDir)
 	model := newModel(ctx, client)
-	model.install = cfg.InstallRemote
 	model.installDefault = cfg.InstallRemote
 	if cfgErr != nil {
-		model.failure = cfgErr.Error()
+		model.config = cfgErr.Error()
 	}
 
 	// No alternate screen: the popup is a pane herdr destroys when it closes,
@@ -57,7 +56,7 @@ func run(ctx context.Context, env *plugin.Env, promptOnly bool) error {
 		initial = promptModel{model: model}
 	}
 	program := tea.NewProgram(initial, tea.WithContext(ctx))
-	go stream(ctx, client, program)
+	go stream(ctx, client, program.Send)
 	_, err := program.Run()
 	if ctx.Err() != nil {
 		return nil
@@ -66,61 +65,45 @@ func run(ctx context.Context, env *plugin.Env, promptOnly bool) error {
 }
 
 // stream keeps a subscription open and forwards what the daemon pushes into
-// the program. A dropped stream is reopened: the daemon can be replaced by a
+// the program through send. A dropped stream is reopened: the daemon can be replaced by a
 // newer build while the popup is open.
-func stream(ctx context.Context, client *herdr.Client, program *tea.Program) {
+func stream(ctx context.Context, client *herdr.Client, send func(tea.Msg)) {
 	for ctx.Err() == nil {
-		s, err := client.OpenStream(ctx, ipc.MethodSubscribe, nil)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(reconnectDelay):
+		if s, err := client.OpenStream(ctx, ipc.MethodSubscribe, nil); err == nil {
+			// The subscription does not replay what it missed, so the list
+			// is read again once it is open.
+			send(reconnectMsg{})
+			for event, err := s.Next(ctx); err == nil; event, err = s.Next(ctx) {
+				if msg := decodeEvent(event); msg != nil {
+					send(msg)
+				}
 			}
-			continue
-		}
-		for {
-			event, err := s.Next(ctx)
-			if err != nil {
-				break
-			}
-			if msg := decodeEvent(event); msg != nil {
-				program.Send(msg)
+			_ = s.Close()
+			if ctx.Err() == nil {
+				send(linkMsg("lost the daemon, reconnecting…"))
 			}
 		}
-		_ = s.Close()
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		case <-time.After(reconnectDelay):
 		}
-		program.Send(reconnectMsg{})
-		time.Sleep(reconnectDelay)
 	}
 }
 
 func decodeEvent(event *herdr.RawEvent) tea.Msg {
-	switch event.Event {
-	case ipc.EventConnectionsChanged:
-		var result daemon.ListResult
-		if err := json.Unmarshal(event.Data, &result); err != nil {
-			return nil
-		}
-		return listMsg(result)
-
-	case ipc.EventJobUpdated:
-		var job jobs.Job
-		if err := json.Unmarshal(event.Data, &job); err != nil {
-			return nil
-		}
+	var list daemon.ListResult
+	var job jobs.Job
+	var out struct {
+		JobID string   `json:"job_id"`
+		Lines []string `json:"lines"`
+	}
+	switch {
+	case event.Event == ipc.EventConnectionsChanged && json.Unmarshal(event.Data, &list) == nil:
+		return listMsg(list)
+	case event.Event == ipc.EventJobUpdated && json.Unmarshal(event.Data, &job) == nil:
 		return jobMsg(job)
-
-	case ipc.EventJobOutput:
-		var out struct {
-			JobID string   `json:"job_id"`
-			Lines []string `json:"lines"`
-		}
-		if err := json.Unmarshal(event.Data, &out); err != nil {
-			return nil
-		}
+	case event.Event == ipc.EventJobOutput && json.Unmarshal(event.Data, &out) == nil:
 		return outputMsg{jobID: out.JobID, lines: out.Lines}
 	}
 	return nil

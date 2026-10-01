@@ -11,247 +11,197 @@ import (
 )
 
 func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.Type == tea.KeyCtrlC {
+	switch {
+	case msg.Type == tea.KeyCtrlC:
 		return m, tea.Quit
-	}
-	if m.dialog != nil {
+	case m.dialog != nil:
 		return m.keyPrompt(msg)
-	}
-	switch m.screen {
-	case screenList:
-		return m.keyList(msg)
-	case screenAliases:
-		return m.keyAliases(msg)
-	case screenForm:
+	case msg.String() == "ctrl+o" && m.typing():
+		if waiting := m.waiting(); len(waiting) > 0 {
+			m.openPrompt(waiting[0])
+		}
+		return m, nil
+	case m.mode == modePick:
+		return m.keyPick(msg)
+	case m.mode == modeForm:
 		return m.keyForm(msg)
-	case screenConfirm:
-		return m.keyConfirm(msg)
-	case screenOutput:
-		return m.keyOutput(msg)
+	case m.mode == modeForget:
+		return m.keyForget(msg)
 	}
-	return m, nil
+	return m.keyBrowse(msg)
 }
 
-func (m model) keyList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q", "esc":
+// keyBrowse handles the list and the detail panel, which act on the same
+// selection.
+func (m model) keyBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	conn, ok := m.current()
+	job, busy := m.pendingJob(conn.ID)
+	switch key := msg.String(); {
+	case key == "esc" && m.mode == modeDetail:
+		m.mode = modeList
+	case key == "esc":
 		return m, tea.Quit
-	case "j", "down", "ctrl+n", "k", "up", "ctrl+p", "pgdown", "pgup", "home", "end":
-		m.cursor = navigate(msg.String(), m.cursor, len(m.conns), m.rows())
-		m.offset = scroll(m.offset, m.cursor, m.rows())
-	case "R", "f5", "ctrl+r":
-		m.status = "refreshing"
-		return m, m.refresh()
-	case "enter":
-		if conn, ok := m.current(); ok {
-			m.screen = screenOutput
-			if job, found := m.jobFor(conn.ID); found && job.State == jobs.StateAwaitingInput {
-				m.openPrompt(job)
-			}
-		}
-	case "a", "ctrl+a", "insert":
-		m.screen = screenAliases
-		m.aliasCursor, m.aliasOffset = 0, 0
-		m.aliasFilter.SetValue("")
-		m.aliasFilter.Focus()
-		m.status = "reading ~/.ssh/config"
+	case strings.Contains(" up k down j pgup pgdown home end ", " "+key+" "):
+		m.cursor = navigate(key, m.cursor, len(m.conns), m.bodyRows())
+		m.offset = scroll(m.offset, m.cursor, m.bodyRows())
+	case key == "a":
+		m.back, m.mode, m.aliasCursor = m.mode, modePick, 0
+		m.filter.SetValue("")
+		m.filter.Focus()
 		return m, m.loadAliases()
-	case "e", "r", "ctrl+e", "f2":
-		if cur, ok := m.current(); ok {
-			m.openForm(cur)
+	case key == "r":
+		return m, m.call(ipc.MethodRefresh)
+	case !ok:
+	case key == "enter":
+		// In a narrow pane the details open under the question, so that
+		// setting it aside leaves them reachable.
+		if !m.wide() {
+			m.mode = modeDetail
 		}
-	case "d", "delete":
-		if cur, ok := m.current(); ok {
-			conn := cur
-			m.confirm = &conn
-			m.screen = screenConfirm
+		if busy && job.State == jobs.StateAwaitingInput {
+			m.openPrompt(job)
 		}
-	case " ":
-		if cur, ok := m.current(); ok {
-			if cur.Active {
-				return m, m.act(ipc.MethodDisconnect, cur.ID, false)
-			}
-			return m, m.act(ipc.MethodConnect, cur.ID, true)
-		}
+	case key == " " && busy:
+		// The job in flight decides the state; cancel it to change course.
+	case key == " " && conn.Active:
+		return m, m.request(ipc.MethodDisconnect, ipc.ConnectionTarget{ID: conn.ID}, "disconnect "+conn.Label+" queued")
+	case key == " ":
+		return m, m.request(ipc.MethodConnect, ipc.ConnectionTarget{ID: conn.ID, Install: true}, "connect "+conn.Label+" queued")
+	case key == "e":
+		m.back = m.mode
+		m.openForm(conn.ID, conn.Label, conn.Target, conn.Session)
+	case key == "d":
+		m.back, m.mode, m.forget = m.mode, modeForget, conn.ID
+	case key == "x" && busy:
+		return m, m.request(ipc.MethodJobCancel, ipc.JobTarget{JobID: job.ID}, "cancelling "+job.Title)
 	}
 	return m, nil
 }
 
-// openForm fills the form from an existing connection.
-func (m *model) openForm(conn daemon.Connection) {
-	m.formBack = m.screen
-	m.editing = conn.ID
-	m.label.SetValue(conn.Label)
-	m.target.SetValue(conn.Target)
-	m.session.SetValue(conn.Session)
-	m.install = m.installDefault
-	m.field = 0
-	m.focusField()
-	m.screen = screenForm
-}
-
-func (m model) keyAliases(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+func (m model) keyPick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	list := m.filtered()
+	switch key := msg.String(); key {
 	case "esc":
-		m.screen = screenList
+		m.mode = m.back
+		m.syncPrompt()
 		return m, nil
-	case "down", "ctrl+n", "up", "ctrl+p", "pgdown", "pgup", "ctrl+home", "ctrl+end":
-		m.aliasCursor = navigate(msg.String(), m.aliasCursor, len(m.filtered()), m.aliasRows())
-		m.aliasOffset = scroll(m.aliasOffset, m.aliasCursor, m.aliasRows())
+	case "up", "down", "pgup", "pgdown":
+		m.aliasCursor = navigate(key, m.aliasCursor, len(list), m.aliasRows())
 		return m, nil
 	case "enter":
-		list := m.filtered()
-		if len(list) == 0 {
-			return m, nil
+		if len(list) > 0 {
+			alias := list[clamp(m.aliasCursor, len(list))]
+			m.openForm("", alias.Name, alias.Name, "")
+		} else {
+			// A target missing from ~/.ssh/config, such as user@host, is typed
+			// into the filter.
+			typed := strings.TrimSpace(m.filter.Value())
+			m.openForm("", typed, typed, "")
 		}
-		alias := list[min(m.aliasCursor, len(list)-1)]
-		m.editing = ""
-		m.label.SetValue(alias.Name)
-		m.target.SetValue(alias.Name)
-		m.session.SetValue("")
-		m.install = m.installDefault
-		m.field = 0
-		m.focusField()
-		m.formBack = screenList
-		m.screen = screenForm
 		return m, nil
 	}
-	previousFilter := m.aliasFilter.Value()
+	before := m.filter.Value()
 	var cmd tea.Cmd
-	m.aliasFilter, cmd = m.aliasFilter.Update(msg)
-	if m.aliasFilter.Value() != previousFilter {
-		m.aliasCursor, m.aliasOffset = 0, 0
+	if m.filter, cmd = m.filter.Update(msg); m.filter.Value() != before {
+		m.aliasCursor = 0
 	}
 	return m, cmd
+}
+
+func (m *model) openForm(id, label, target, session string) {
+	m.mode, m.editing, m.install = modeForm, id, m.installDefault
+	for i, value := range []string{label, target, session} {
+		m.fields[i].SetValue(value)
+		m.fields[i].CursorEnd()
+	}
+	m.focus(0)
+}
+
+func (m *model) focus(field int) {
+	m.field = (field + 4) % 4
+	for i := range m.fields {
+		if i == m.field {
+			m.fields[i].Focus()
+		} else {
+			m.fields[i].Blur()
+		}
+	}
 }
 
 func (m model) keyForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.screen = m.formBack
-		return m, nil
-	case "tab", "down", "ctrl+n":
-		m.field = (m.field + 1) % 4
-		m.focusField()
-		return m, nil
-	case "shift+tab", "up", "ctrl+p":
-		m.field = (m.field + 3) % 4
-		m.focusField()
-		return m, nil
-	case " ":
-		if m.field == 3 {
-			m.install = !m.install
-			return m, nil
-		}
-	case "enter", "ctrl+s":
-		label, target := strings.TrimSpace(m.label.Value()), strings.TrimSpace(m.target.Value())
-		if label == "" || target == "" {
-			m.failure = "a label and an ssh target are required"
-			return m, nil
-		}
-		params := ipc.SaveParams{
-			ID:      m.editing,
-			Label:   label,
-			Target:  target,
-			Session: strings.TrimSpace(m.session.Value()),
-			Install: m.install,
-		}
-		m.screen = m.formBack
-		return m, m.save(params)
-	}
 	var cmd tea.Cmd
-	switch m.field {
-	case 0:
-		m.label, cmd = m.label.Update(msg)
-	case 1:
-		m.target, cmd = m.target.Update(msg)
-	case 2:
-		m.session, cmd = m.session.Update(msg)
+	switch key := msg.String(); {
+	case key == "esc":
+		m.mode = m.back
+		m.syncPrompt()
+	case key == "tab" || key == "down":
+		m.focus(m.field + 1)
+	case key == "shift+tab" || key == "up":
+		m.focus(m.field - 1)
+	case key == "enter":
+		if p := m.formParams(); p.Label == "" || p.Target == "" {
+			m.failure = "a label and an ssh target are required"
+		} else {
+			m.mode = m.back
+			m.syncPrompt()
+			return m, m.request(ipc.MethodSave, p, "saved "+p.Label)
+		}
+	case m.field == 3:
+		if key == " " {
+			m.install = !m.install
+		}
+	default:
+		m.fields[m.field], cmd = m.fields[m.field].Update(msg)
 	}
 	return m, cmd
 }
 
-func (m model) keyConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) formParams() ipc.SaveParams {
+	return ipc.SaveParams{
+		ID:      m.editing,
+		Label:   strings.TrimSpace(m.fields[0].Value()),
+		Target:  strings.TrimSpace(m.fields[1].Value()),
+		Session: strings.TrimSpace(m.fields[2].Value()),
+		Install: m.install,
+	}
+}
+
+// reconnects reports the active connection a save would disconnect and
+// connect again, which the daemon does when its target or session changes.
+func (m model) reconnects() (daemon.Connection, bool) {
+	conn, ok := m.connByID(m.editing)
+	p := m.formParams()
+	return conn, ok && conn.Active && (conn.Target != p.Target || conn.Session != p.Session)
+}
+
+func (m model) keyForget(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "y", "enter":
-		target := m.confirm
-		m.screen = screenList
-		m.confirm = nil
-		if target == nil {
-			return m, nil
+	case "esc":
+		m.mode = m.back
+	case "enter":
+		m.mode = modeList
+		if conn, ok := m.connByID(m.forget); ok {
+			return m, m.request(ipc.MethodForget, ipc.ConnectionTarget{ID: conn.ID}, "forget "+conn.Label+" queued")
 		}
-		return m, m.act(ipc.MethodForget, target.ID, false)
-	case "n", "esc", "q":
-		m.screen = screenList
-		m.confirm = nil
 	}
 	return m, nil
 }
 
-// keyOutput drives the per-connection output view: it forwards typing to a
-// command that is waiting for an answer, and otherwise only navigates.
-func (m model) keyOutput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	conn, ok := m.current()
-	if !ok {
-		m.screen = screenList
-		return m, nil
-	}
-	job, hasJob := m.lastJobFor(conn.ID)
-	if msg.String() == "ctrl+x" {
-		if hasJob && !job.State.Terminal() {
-			return m, m.cancel(job.ID)
-		}
-		return m, nil
-	}
-	if hasJob && job.State == jobs.StateAwaitingInput && msg.String() == "enter" {
-		m.openPrompt(job)
-		return m, nil
-	}
-
-	switch msg.String() {
-	case "esc", "q", "enter":
-		m.screen = screenList
-	case "x":
-		if hasJob && !job.State.Terminal() {
-			return m, m.cancel(job.ID)
-		}
-	case "e", "r", "ctrl+e", "f2":
-		m.openForm(conn)
-	case "R", "f5", "ctrl+r":
-		return m, m.refresh()
-	}
-	return m, nil
-}
-
-// navigate applies list navigation without changing text-input key bindings.
+// navigate moves a cursor through length items shown rows at a time.
 func navigate(key string, cursor, length, rows int) int {
 	switch key {
-	case "j", "down", "ctrl+n":
+	case "down", "j":
 		cursor++
-	case "k", "up", "ctrl+p":
+	case "up", "k":
 		cursor--
 	case "pgdown":
 		cursor += rows
 	case "pgup":
 		cursor -= rows
-	case "home", "ctrl+home":
+	case "home":
 		cursor = 0
-	case "end", "ctrl+end":
+	case "end":
 		cursor = length - 1
 	}
 	return clamp(cursor, length)
-}
-
-func (m *model) focusField() {
-	m.label.Blur()
-	m.target.Blur()
-	m.session.Blur()
-	switch m.field {
-	case 0:
-		m.label.Focus()
-	case 1:
-		m.target.Focus()
-	case 2:
-		m.session.Focus()
-	}
 }
