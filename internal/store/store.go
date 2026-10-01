@@ -124,6 +124,25 @@ func (s *Store) Put(c Connection) (Connection, error) {
 	return c, nil
 }
 
+// Restore replaces an existing record exactly, including its timestamps, when
+// the operation that required a save could not be queued.
+func (s *Store) Restore(c Connection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := append([]Connection(nil), s.conns...)
+	for i := range next {
+		if next[i].ID == c.ID {
+			next[i] = c
+			if err := s.save(next); err != nil {
+				return err
+			}
+			s.conns = next
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
 // Delete removes a connection.
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()

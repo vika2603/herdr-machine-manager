@@ -104,6 +104,9 @@ func TestFailedWritesDoNotChangeMemory(t *testing.T) {
 	if _, err := s.Put(Connection{Label: "New", Target: "new"}); err == nil {
 		t.Fatal("insert unexpectedly succeeded")
 	}
+	if err := s.Restore(original); err == nil {
+		t.Fatal("restore unexpectedly succeeded")
+	}
 	if err := s.Delete(original.ID); err == nil {
 		t.Fatal("delete unexpectedly succeeded")
 	}

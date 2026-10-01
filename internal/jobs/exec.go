@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 )
@@ -150,7 +151,11 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 				}
 			}
 			if len(pending) > maxPendingBytes {
-				pending = pending[len(pending)-maxPendingBytes:]
+				start := len(pending) - maxPendingBytes
+				for start < len(pending) && !utf8.RuneStart(pending[start]) {
+					start++
+				}
+				pending = pending[start:]
 				if !truncated {
 					sink.Lines([]string{"[long output line truncated]"})
 					truncated = true

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // script writes an executable shell script and returns the argv that runs it.
@@ -393,12 +394,15 @@ func TestOutputDoesNotClearAPendingPrompt(t *testing.T) {
 func TestLongUnterminatedOutputKeepsPromptBounded(t *testing.T) {
 	q, rec := newTestQueue(t)
 	job, err := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
-		Args: script(t, "printf '%50000s' x\nprintf 'passphrase: '\nread p\necho done\n")})
+		Args: script(t, "i=0; while [ $i -lt 2000 ]; do printf '界'; i=$((i+1)); done\nprintf 'passphrase: '\nread p\necho done\n")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the prompt after the long output", func() bool { return rec.state(job.ID) == StateAwaitingInput })
 	current := q.List()[0]
+	if !utf8.ValidString(current.Prompt) {
+		t.Errorf("prompt begins with broken UTF-8: %q", current.Prompt[:min(12, len(current.Prompt))])
+	}
 	if !strings.Contains(current.Prompt, "passphrase:") || len(current.Prompt) > maxPendingBytes {
 		t.Errorf("prompt length = %d, tail = %q; want a bounded prompt", len(current.Prompt), current.Prompt[max(0, len(current.Prompt)-60):])
 	}

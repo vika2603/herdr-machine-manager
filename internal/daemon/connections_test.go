@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -204,7 +205,12 @@ func fakeHerdr(t *testing.T, listJSON string) string {
 func TestSaveReportsQueueFailureWithoutPartialReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	d := newTestDaemon(t)
+	path := filepath.Join(t.TempDir(), "connections.json")
+	connections, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{store: connections}
 	original, err := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "ep-1"})
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +234,10 @@ func TestSaveReportsQueueFailureWithoutPartialReconnect(t *testing.T) {
 		}
 	}
 	before := len(d.queue.List())
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = d.save(ctx, ipc.SaveParams{ID: original.ID, Label: "Deploy", Target: "new-target"})
 	if err == nil || !strings.Contains(err.Error(), "job not queued") {
 		t.Fatalf("save error = %v, want a visible queue failure", err)
@@ -235,8 +245,15 @@ func TestSaveReportsQueueFailureWithoutPartialReconnect(t *testing.T) {
 	if got := len(d.queue.List()); got != before {
 		t.Errorf("save queued only part of reconnect: %d jobs, want %d", got, before)
 	}
-	if saved, _ := d.store.Get(original.ID); saved.Target != original.Target {
-		t.Errorf("failed save changed target to %q; retry would not queue a reconnect", saved.Target)
+	if saved, _ := d.store.Get(original.ID); saved != original {
+		t.Errorf("failed save changed the record: got %+v, want %+v", saved, original)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, persisted) {
+		t.Errorf("failed save changed connections.json:\n%s", after)
 	}
 }
 

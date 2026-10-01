@@ -293,7 +293,7 @@ func (d *Daemon) save(ctx context.Context, p ipc.SaveParams) (ipc.SaveResult, er
 		// retrying the form still queues the intended operation.
 		var rollbackErr error
 		if existed {
-			_, rollbackErr = d.store.Put(previous)
+			rollbackErr = d.store.Restore(previous)
 		} else {
 			rollbackErr = d.store.Delete(saved.ID)
 		}
