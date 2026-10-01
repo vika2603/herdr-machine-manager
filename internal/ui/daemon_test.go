@@ -64,8 +64,7 @@ func TestPromptSendsSelectedAnswerToItsJob(t *testing.T) {
 				received <- p
 				return map[string]string{"status": "ok"}, nil
 			})
-			m := newModel(context.Background(), herdr.New(path))
-			m.mergeJobs([]jobs.Job{waitingJob("target-job", "c1", tc.prompt)})
+			m := send(newModel(context.Background(), herdr.New(path)), listMsg{Jobs: []jobs.Job{waitingJob("target-job", "c1", tc.prompt)}})
 			if tc.yes {
 				m, _ = promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyRight})
 			}

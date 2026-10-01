@@ -12,16 +12,36 @@ import (
 	"github.com/vika2603/herdr-machine-manager/internal/sshconfig"
 )
 
-// Colours are ANSI indexes, and secondary text is faint rather than grey, so
-// the popup follows the terminal's dark or light theme. Yellow is left out:
-// it is unreadable on most light themes.
+// The palette has a variant for dark and for light terminal backgrounds, each
+// readable on its background; Lip Gloss picks the variant and degrades the
+// colour on terminals with fewer colours. Text without a role keeps the
+// terminal's own foreground. One accent marks focus and action; the state
+// colours appear only where a state is shown.
 var (
-	boldStyle    = lipgloss.NewStyle().Bold(true)
-	faintStyle   = lipgloss.NewStyle().Faint(true)
-	accentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	greenStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	redStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	magentaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+	accentColor = lipgloss.AdaptiveColor{Light: "#6A4BE0", Dark: "#A891FF"}
+	badgeColor  = lipgloss.AdaptiveColor{Light: "#6A4BE0", Dark: "#7D56F4"}
+	greenColor  = lipgloss.AdaptiveColor{Light: "#1F7A3A", Dark: "#8FDB9A"}
+	blueColor   = lipgloss.AdaptiveColor{Light: "#1D5FC4", Dark: "#89B4FA"}
+	amberColor  = lipgloss.AdaptiveColor{Light: "#985200", Dark: "#F9B562"}
+	redColor    = lipgloss.AdaptiveColor{Light: "#C02B3C", Dark: "#F38BA8"}
+	greyColor   = lipgloss.AdaptiveColor{Light: "#5E6472", Dark: "#9399B2"}
+	pinkColor   = lipgloss.AdaptiveColor{Light: "#A8307E", Dark: "#F0A6D8"}
+	// Backgrounds of the selected row, of blocks of command output, and of
+	// key caps and unselected buttons.
+	selectedBg = lipgloss.AdaptiveColor{Light: "#ECE7FC", Dark: "#312A4D"}
+	blockBg    = lipgloss.AdaptiveColor{Light: "#EFEFF3", Dark: "#282838"}
+	capBg      = lipgloss.AdaptiveColor{Light: "#ECEAF4", Dark: "#313149"}
+	noBg       = lipgloss.NoColor{}
+
+	boldStyle   = lipgloss.NewStyle().Bold(true)
+	mutedStyle  = lipgloss.NewStyle().Foreground(greyColor)
+	accentStyle = lipgloss.NewStyle().Foreground(accentColor)
+	greenStyle  = lipgloss.NewStyle().Foreground(greenColor)
+	blueStyle   = lipgloss.NewStyle().Foreground(blueColor)
+	amberStyle  = lipgloss.NewStyle().Foreground(amberColor)
+	redStyle    = lipgloss.NewStyle().Foreground(redColor)
+	badgeStyle  = lipgloss.NewStyle().Background(badgeColor).Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+	capStyle    = lipgloss.NewStyle().Background(capBg).Foreground(accentColor).Bold(true)
 )
 
 const (
@@ -30,7 +50,8 @@ const (
 	wideMin = 76
 	// defaultCols and defaultRows apply until the first resize arrives.
 	defaultCols, defaultRows = 100, 26
-	// chromeRows is the header, its rule, the status rule and the hint line.
+	// chromeRows is the header, the space under it, the status line and the
+	// hint line.
 	chromeRows = 4
 	// keyWidth is the column a panel's setting names take.
 	keyWidth = 10
@@ -47,8 +68,8 @@ func (l look) String() string { return l.style.Render(l.glyph + " " + l.word) }
 
 var (
 	lookConnected    = look{"●", "connected", greenStyle}
-	lookDisconnected = look{"○", "disconnected", faintStyle}
-	lookAsking       = look{"◆", "needs answer", magentaStyle}
+	lookDisconnected = look{"○", "disconnected", mutedStyle}
+	lookAsking       = look{"◆", "needs answer", amberStyle}
 	progressWords    = map[jobs.Kind]string{jobs.KindConnect: "connecting…", jobs.KindDisconnect: "disconnecting…", jobs.KindRename: "renaming…", jobs.KindForget: "forgetting…"}
 )
 
@@ -56,7 +77,7 @@ func jobLook(job jobs.Job) look {
 	kind := string(job.Kind)
 	switch job.State {
 	case jobs.StateQueued:
-		return look{"◌", kind + " queued", accentStyle}
+		return look{"◌", kind + " queued", blueStyle}
 	case jobs.StateAwaitingInput:
 		return lookAsking
 	case jobs.StateSucceeded:
@@ -64,9 +85,9 @@ func jobLook(job jobs.Job) look {
 	case jobs.StateFailed:
 		return look{"✕", kind + " failed", redStyle}
 	case jobs.StateCancelled:
-		return look{"⊘", kind + " cancelled", faintStyle}
+		return look{"⊘", kind + " cancelled", mutedStyle}
 	}
-	return look{"◐", or(progressWords[job.Kind], kind+"…"), accentStyle}
+	return look{"◐", or(progressWords[job.Kind], kind+"…"), blueStyle}
 }
 
 // connLook is the state a connection shows: a job in flight wins over the
@@ -85,13 +106,23 @@ func (m model) connLook(c daemon.Connection) (look, string) {
 	return lookDisconnected, ""
 }
 
-func (m model) cols() int      { return or(m.width, defaultCols) }
-func (m model) rows() int      { return or(m.height, defaultRows) }
-func (m model) wide() bool     { return m.cols() >= wideMin }
-func (m model) bodyRows() int  { return max(1, m.rows()-chromeRows) }
-func (m model) aliasRows() int { return max(1, m.bodyRows()-3) }
+func (m model) cols() int     { return or(m.width, defaultCols) }
+func (m model) rows() int     { return or(m.height, defaultRows) }
+func (m model) wide() bool    { return m.cols() >= wideMin }
+func (m model) bodyRows() int { return max(1, m.rows()-chromeRows) }
 
-// listWidth and panelWidth exclude the one-column margins and the divider.
+// panelRows is the rows inside the panel's border, which a body shorter than
+// three rows has no room for.
+func (m model) panelRows() int {
+	if rows := m.bodyRows(); rows >= 3 {
+		return rows - 2
+	}
+	return m.bodyRows()
+}
+
+func (m model) aliasRows() int { return max(1, m.panelRows()-3) }
+
+// listWidth and panelWidth exclude the margins and the gap between them.
 func (m model) listWidth() int {
 	if !m.wide() {
 		return m.cols() - 2
@@ -103,54 +134,41 @@ func (m model) panelWidth() int {
 	if !m.wide() {
 		return m.cols() - 2
 	}
-	return m.cols() - m.listWidth() - 5
+	return m.cols() - m.listWidth() - 4
 }
 
 type hint struct{ key, action string }
 
-// frame lays out every screen the same way: a header with a summary, a rule,
-// the body, a rule carrying the status, and one line of key hints. Without the
+// frame lays out every screen the same way: a header with the title badge and
+// the counts, the body, a status line, and one line of key hints. Without the
 // alternate screen a taller frame would scroll its own top away, so the frame
 // is exactly the pane's size and no line is wider than it.
-func (m model) frame(title, summary string, left, right []string, hints []hint) string {
-	w, divider := m.cols(), -1
-	if right != nil {
-		divider = m.listWidth() + 2
+func (m model) frame(title string, summary []string, left, right []string, hints []hint) string {
+	w := m.cols()
+	head := " " + badgeStyle.Render(" "+title+" ")
+	for _, part := range summary {
+		if lipgloss.Width(head)+2+lipgloss.Width(part) > w-1 {
+			break
+		}
+		head += "  " + part
 	}
-	head := " " + boldStyle.Render(title)
-	summary = ansi.Truncate(summary, max(0, w-lipgloss.Width(head)-3), "…")
-	head += strings.Repeat(" ", max(1, w-1-lipgloss.Width(head)-lipgloss.Width(summary))) + faintStyle.Render(summary)
-	out := []string{head, rule(w, divider, '┬', "")}
+	out := []string{head, ""}
 	for i := range m.bodyRows() {
 		line := " " + at(left, i)
 		if right != nil {
-			line = " " + fit(at(left, i), m.listWidth()) + faintStyle.Render(" │ ") + at(right, i)
+			line = " " + fit(at(left, i), m.listWidth()) + "  " + at(right, i)
 		}
 		out = append(out, line)
 	}
-	note := faintStyle.Render(m.status)
+	note := mutedStyle.Render(m.status)
 	if err := or(m.failure, or(m.link, m.config)); err != "" {
 		note = redStyle.Render("✕ " + oneLine(err))
 	}
-	out = append(out, rule(w, divider, '┴', note), hintLine(hints, w))
+	out = append(out, " "+ansi.Truncate(note, max(0, w-2), "…"), hintLine(hints, w))
 	for i := range out {
 		out[i] = ansi.Truncate(out[i], w, "")
 	}
 	return strings.Join(out[max(0, len(out)-m.rows()):], "\n")
-}
-
-// rule is a full-width line meeting the divider, or carrying note near its
-// start instead.
-func rule(w, divider int, junction rune, note string) string {
-	line := []rune(strings.Repeat("─", w))
-	if note == "" {
-		if divider >= 0 && divider < w {
-			line[divider] = junction
-		}
-		return faintStyle.Render(string(line))
-	}
-	note = ansi.Truncate(note, max(0, w-4), "…")
-	return faintStyle.Render("─ ") + note + faintStyle.Render(" "+string(line[min(w, 3+lipgloss.Width(note)):]))
 }
 
 // hintLine drops hints from the end, keeping the last, until the line fits:
@@ -159,14 +177,66 @@ func hintLine(hints []hint, w int) string {
 	for {
 		parts := make([]string, len(hints))
 		for i, h := range hints {
-			parts[i] = h.key + " " + faintStyle.Render(h.action)
+			parts[i] = capStyle.Render(" "+h.key+" ") + " " + mutedStyle.Render(h.action)
 		}
-		line := " " + strings.Join(parts, "   ")
+		line := " " + strings.Join(parts, "  ")
 		if len(hints) <= 1 || lipgloss.Width(line) <= w {
 			return line
 		}
 		hints = append(hints[:len(hints)-2:len(hints)-2], hints[len(hints)-1])
 	}
+}
+
+// box frames what fill draws in a rounded border of colour, with the title
+// set into the top edge, w columns by h rows. Below three rows there is no
+// room for a border and fill draws on its own.
+func box(w, h int, colour lipgloss.TerminalColor, fill func(w, rows int) (string, []string)) []string {
+	if h < 3 {
+		_, lines := fill(w, h)
+		return lines
+	}
+	title, lines := fill(w-4, h-2)
+	edge := lipgloss.NewStyle().Foreground(colour)
+	title = ansi.Truncate(title, max(0, w-6), "…")
+	top := edge.Render("╭" + strings.Repeat("─", w-2) + "╮")
+	if title != "" {
+		top = edge.Render("╭─ ") + edge.Bold(true).Render(title) + edge.Render(" "+strings.Repeat("─", max(0, w-5-lipgloss.Width(title)))+"╮")
+	}
+	out := []string{top}
+	for i := range h - 2 {
+		out = append(out, edge.Render("│")+" "+fit(at(lines, i), w-4)+" "+edge.Render("│"))
+	}
+	return append(out, edge.Render("╰"+strings.Repeat("─", w-2)+"╯"))
+}
+
+// cell is plain text in a style; row draws cells on one background.
+type cell struct {
+	text  string
+	style lipgloss.Style
+}
+
+// row renders cells side by side on bg and pads them to w columns. Each cell
+// carries the background itself: a styled string nested in another would
+// reset it.
+func row(cells []cell, w int, bg lipgloss.TerminalColor) string {
+	var b strings.Builder
+	used := 0
+	for _, c := range cells {
+		text := ansi.Truncate(c.text, max(0, w-used), "…")
+		used += lipgloss.Width(text)
+		b.WriteString(c.style.Background(bg).Render(text))
+	}
+	b.WriteString(lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", max(0, w-used))))
+	return b.String()
+}
+
+// selection is the bar, background and label style of a row, which mark the
+// selected one.
+func selection(selected bool) (cell, lipgloss.TerminalColor, lipgloss.Style) {
+	if selected {
+		return cell{"▌ ", accentStyle}, selectedBg, boldStyle
+	}
+	return cell{"  ", lipgloss.NewStyle()}, noBg, lipgloss.NewStyle()
 }
 
 func (m model) View() string {
@@ -175,15 +245,16 @@ func (m model) View() string {
 	var panel []string
 	switch {
 	case m.dialog != nil:
-		panel = m.promptLines(pw, rows)
+		panel = box(pw, rows, promptColour(m.dialog.info.Kind), m.promptLines)
 	case m.mode == modePick:
-		panel = m.pickLines(pw, rows)
+		panel = box(pw, rows, accentColor, m.pickLines)
 	case m.mode == modeForm:
-		panel = m.formLines(pw, rows)
+		panel = box(pw, rows, accentColor, m.formLines)
 	case m.mode == modeForget:
-		panel = m.forgetLines(pw, rows)
+		panel = box(pw, rows, accentColor, m.forgetLines)
 	case selected && (m.wide() || m.mode == modeDetail):
-		panel = m.detailLines(conn, pw, rows)
+		l, _ := m.connLook(conn)
+		panel = box(pw, rows, l.style.GetForeground(), func(w, rows int) (string, []string) { return conn.Label, m.detailLines(conn, w, rows) })
 	case m.wide():
 		panel = []string{}
 	}
@@ -193,18 +264,37 @@ func (m model) View() string {
 	return m.frame("Machines", m.summary(), m.listLines(), panel, m.hints())
 }
 
-func (m model) summary() string {
-	active := 0
+// summary counts the connections by state, each count in its state's colour.
+// The header drops counts from the end when it runs out of room.
+func (m model) summary() []string {
+	active, failed, busy := 0, 0, 0
 	for _, c := range m.conns {
+		l, _ := m.connLook(c)
+		switch l.glyph {
+		case "✕":
+			failed++
+		case "◐", "◌":
+			busy++
+		}
 		if c.Active {
 			active++
 		}
 	}
-	s := fmt.Sprintf("%d of %d connected", active, len(m.conns))
+	parts := []string{count(greenStyle, "●", fmt.Sprintf("%d of %d", active, len(m.conns)), "connected")}
 	if n := len(m.waiting()); n > 0 {
-		s += fmt.Sprintf(" · %d needs answer", n)
+		parts = append(parts, count(amberStyle, "◆", fmt.Sprint(n), "needs answer"))
 	}
-	return s
+	if failed > 0 {
+		parts = append(parts, count(redStyle, "✕", fmt.Sprint(failed), "failed"))
+	}
+	if busy > 0 {
+		parts = append(parts, count(blueStyle, "◐", fmt.Sprint(busy), "busy"))
+	}
+	return parts
+}
+
+func count(style lipgloss.Style, glyph, n, word string) string {
+	return style.Render(glyph+" "+n) + " " + mutedStyle.Render(word)
 }
 
 func (m model) hints() []hint {
@@ -260,12 +350,12 @@ func (m model) typingHints() []hint {
 	return append(hs, hint{"esc", "cancel"})
 }
 
-// listLines is one row per connection: the selection mark, the state glyph,
+// listLines is one row per connection: the selection bar, the state glyph,
 // the label and the state word in aligned columns, then the error or the
 // target as room allows.
 func (m model) listLines() []string {
 	if len(m.conns) == 0 {
-		return []string{"", faintStyle.Render(" No connections yet."), faintStyle.Render(" Press a to add one from ~/.ssh/config.")}
+		return []string{"", mutedStyle.Render(" No connections yet."), mutedStyle.Render(" Press a to add one from ~/.ssh/config.")}
 	}
 	w := m.listWidth()
 	m.offset = scroll(m.offset, m.cursor, m.bodyRows())
@@ -280,23 +370,29 @@ func (m model) listLines() []string {
 	var out []string
 	for i, c := range shown {
 		l, failure := m.connLook(c)
-		mark, label := "  ", fit(c.Label, labelW)
-		if m.offset+i == m.cursor {
-			mark, label = accentStyle.Render("❯ "), boldStyle.Render(label)
-		}
-		row := mark + l.style.Render(l.glyph) + " " + label + "  " + l.style.Render(fit(l.word, wordW))
-		if room := w - lipgloss.Width(row) - 2; room >= 6 && failure != "" {
-			row += "  " + redStyle.Render(fit(oneLine(failure), room))
+		bar, bg, labelStyle := selection(m.offset+i == m.cursor)
+		cells := []cell{bar, {l.glyph + " ", l.style}, {fit(c.Label, labelW) + "  ", labelStyle}, {fit(l.word, wordW), l.style}}
+		if room := w - labelW - wordW - 8; room >= 6 && failure != "" {
+			cells = append(cells, cell{"  " + fit(oneLine(failure), room), redStyle})
 		} else if room >= 6 {
-			row += "  " + faintStyle.Render(fit(c.Target, room))
+			cells = append(cells, cell{"  " + fit(c.Target, room), mutedStyle})
 		}
-		out = append(out, row)
+		out = append(out, row(cells, w, bg))
 	}
 	return out
 }
 
 func setting(name, value string, w int) string {
-	return faintStyle.Render(fit(name, keyWidth)) + ansi.Truncate(value, max(0, w-keyWidth), "…")
+	return mutedStyle.Render(fit(name, keyWidth)) + ansi.Truncate(value, max(0, w-keyWidth), "…")
+}
+
+// block is text set apart on its own background, as command output is.
+func block(lines []string, w int, style lipgloss.Style) []string {
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		out[i] = row([]cell{{" " + line, style}}, w, blockBg)
+	}
+	return out
 }
 
 // detailLines is the selected connection's panel: its state with the error or
@@ -304,7 +400,7 @@ func setting(name, value string, w int) string {
 // fits.
 func (m model) detailLines(c daemon.Connection, w, rows int) []string {
 	l, failure := m.connLook(c)
-	lines := []string{boldStyle.Render(fit(c.Label, w)), l.String()}
+	lines := []string{l.style.Bold(true).Render(l.glyph + " " + l.word)}
 	for _, line := range limit(wrap(failure, w-2), 3) {
 		lines = append(lines, "  "+redStyle.Render(line))
 	}
@@ -315,13 +411,13 @@ func (m model) detailLines(c daemon.Connection, w, rows int) []string {
 		job, hasJob = m.lastJob(c.ID)
 	}
 	if hasJob && job.State == jobs.StateAwaitingInput {
-		lines = append(lines, "  "+magentaStyle.Render(ansi.Truncate(oneLine(job.Prompt), w-2, "…")))
+		lines = append(lines, "  "+amberStyle.Render(ansi.Truncate(oneLine(job.Prompt), w-2, "…")))
 	}
 	lines = append(lines, "", setting("Target", c.Target, w))
 	if alias, ok := find(m.aliases, func(a sshconfig.Alias) bool { return a.Name == c.Target }); ok && alias.Host != "" {
 		lines = append(lines, setting("Address", endpoint(alias.User, alias.Host, alias.Port), w))
 	}
-	lines = append(lines, setting("Session", or(c.Session, faintStyle.Render("default")), w))
+	lines = append(lines, setting("Session", or(c.Session, mutedStyle.Render("default")), w))
 	if !hasJob {
 		return squeeze(lines, rows)
 	}
@@ -330,26 +426,29 @@ func (m model) detailLines(c daemon.Connection, w, rows int) []string {
 		lines = append(lines, setting("Last job", jobLook(job).String(), w))
 	}
 	if output, room := m.outputs[job.ID], rows-len(lines)-2; room > 0 && len(output) > 0 {
-		lines = append(lines, "", faintStyle.Render("Output"))
+		lines = append(lines, "", mutedStyle.Render("Output"))
+		var tail []string
 		for _, line := range output[max(0, len(output)-room):] {
-			lines = append(lines, faintStyle.Render(fit(oneLine(line), w)))
+			tail = append(tail, oneLine(line))
 		}
+		lines = append(lines, block(tail, w, lipgloss.NewStyle())...)
 	}
 	return squeeze(lines, rows)
 }
 
-func (m model) pickLines(w, rows int) []string {
+func (m model) pickLines(w, rows int) (string, []string) {
 	list, filter := m.filtered(), m.filter
-	filter.Width = max(1, w-keyWidth)
+	filter.Width = max(1, w-keyWidth-1)
 	lines := []string{
-		boldStyle.Render("Add a connection") + faintStyle.Render(fmt.Sprintf("  %d of %d aliases", len(list), len(m.aliases))),
-		faintStyle.Render(fit("Filter", keyWidth)) + filter.View(),
+		accentStyle.Render(fit("Filter", keyWidth)) + filter.View(),
+		mutedStyle.Render(fmt.Sprintf("%d of %d aliases", len(list), len(m.aliases))),
 		"",
 	}
+	title := "Add a connection"
 	if typed := strings.TrimSpace(m.filter.Value()); len(list) == 0 && typed != "" {
-		return squeeze(append(lines, wrap("No alias in ~/.ssh/config matches. Press enter to add "+typed+" as the ssh target and label.", w)...), rows)
+		return title, squeeze(append(lines, wrap("No alias in ~/.ssh/config matches. Press enter to add "+typed+" as the ssh target and label.", w)...), rows)
 	} else if len(list) == 0 {
-		return squeeze(append(lines, wrap("No alias in ~/.ssh/config. Press enter to type a target.", w)...), rows)
+		return title, squeeze(append(lines, wrap("No alias in ~/.ssh/config. Press enter to type a target.", w)...), rows)
 	}
 	nameW := 0
 	for _, a := range list {
@@ -359,35 +458,38 @@ func (m model) pickLines(w, rows int) []string {
 	offset := max(0, m.aliasCursor-m.aliasRows()+1)
 	for i := offset; i < min(offset+m.aliasRows(), len(list)); i++ {
 		a := list[i]
-		mark, name := "  ", fit(a.Name, nameW)
-		if i == m.aliasCursor {
-			mark, name = accentStyle.Render("❯ "), boldStyle.Render(name)
-		}
-		addr := faintStyle.Render(endpoint(a.User, a.Host, a.Port))
+		bar, bg, nameStyle := selection(i == m.aliasCursor)
+		cells := []cell{bar, {fit(a.Name, nameW) + "  ", nameStyle}}
+		addr := endpoint(a.User, a.Host, a.Port)
 		if index(m.conns, func(c daemon.Connection) bool { return c.Target == a.Name }) >= 0 {
-			addr = fit(addr, max(0, w-nameW-13)) + "  " + greenStyle.Render("added")
+			cells = append(cells, cell{fit(addr, max(0, w-nameW-11)), mutedStyle}, cell{"  added", greenStyle})
+		} else {
+			cells = append(cells, cell{addr, mutedStyle})
 		}
-		lines = append(lines, mark+name+"  "+addr)
+		lines = append(lines, row(cells, w, bg))
 	}
 	// In a pane too short for the whole panel the selected alias, which is
-	// last in the window, outlasts the title and the filter.
-	return lines[max(0, len(lines)-rows):]
+	// last in the window, outlasts the filter.
+	return title, lines[max(0, len(lines)-rows):]
 }
 
-func (m model) formLines(w, rows int) []string {
-	lines := []string{boldStyle.Render(map[bool]string{true: "New connection", false: "Edit connection"}[m.editing == ""]), ""}
+func (m model) formLines(w, rows int) (string, []string) {
+	var lines []string
 	for i, name := range []string{"Label", "Target", "Session", "Install"} {
-		mark, key := "  ", faintStyle.Render(fit(name, keyWidth-1))
+		mark, key := "  ", mutedStyle.Render(fit(name, keyWidth-2))
 		if i == m.field {
-			mark, key = accentStyle.Render("❯ "), accentStyle.Render(fit(name, keyWidth-1))
+			mark, key = accentStyle.Render("▌ "), accentStyle.Bold(true).Render(fit(name, keyWidth-2))
 		}
-		value := map[bool]string{true: "[x]", false: "[ ]"}[m.install] + " allow installing herdr on the remote"
+		value := mutedStyle.Render("[ ]") + " allow installing herdr on the remote"
+		if m.install {
+			value = accentStyle.Bold(true).Render("[✓]") + " allow installing herdr on the remote"
+		}
 		if i < 3 {
 			in := m.fields[i]
-			in.Width = max(1, w-keyWidth-2)
+			in.Width = max(1, w-keyWidth-1)
 			value = in.View()
 		}
-		lines = append(lines, mark+key+ansi.Truncate(value, max(0, w-keyWidth-1), "…"))
+		lines = append(lines, mark+key+ansi.Truncate(value, max(0, w-keyWidth), "…"))
 	}
 	lines = append(lines, "")
 	if conn, ok := m.reconnects(); ok {
@@ -398,48 +500,59 @@ func (m model) formLines(w, rows int) []string {
 	if p.Session != "" {
 		command += " --remote-session " + p.Session
 	}
-	for _, line := range limit(wrap(command, w), 2) {
-		lines = append(lines, faintStyle.Render(line))
-	}
-	return squeeze(lines, rows)
+	lines = append(lines, block(limit(wrap(command, w-1), 2), w, mutedStyle)...)
+	return map[bool]string{true: "New connection", false: "Edit connection"}[m.editing == ""], squeeze(lines, rows)
 }
 
-func (m model) forgetLines(w, rows int) []string {
+func (m model) forgetLines(w, rows int) (string, []string) {
 	conn, _ := m.connByID(m.forget)
 	note := "It is not connected, so only its saved settings here are removed."
 	if conn.Active {
 		note = "It is connected, so it is also removed from herdr. Sessions already running on that host keep running."
 	}
-	lines := []string{boldStyle.Render(fit("Forget "+conn.Label+"?", w)), "", setting("Target", conn.Target, w), ""}
-	return squeeze(append(lines, wrap(note, w)...), rows)
+	lines := []string{setting("Target", conn.Target, w), ""}
+	return "Forget " + conn.Label + "?", squeeze(append(lines, wrap(note, w)...), rows)
+}
+
+// promptColour is the accent of a question's card, which follows the kind of
+// answer it wants.
+func promptColour(kind jobs.PromptKind) lipgloss.TerminalColor {
+	switch kind {
+	case jobs.PromptConfirm:
+		return amberColor
+	case jobs.PromptSecret:
+		return pinkColor
+	}
+	return accentColor
 }
 
 // promptLines is the waiting question: whose it is, what kind of answer it
 // wants, as much of the question as fits, and the answer control, which is
 // never cut.
-func (m model) promptLines(w, rows int) []string {
+func (m model) promptLines(w, rows int) (string, []string) {
 	d := m.dialog
-	who := boldStyle.Render(ansi.Truncate(d.jobID, w, "…"))
+	kindStyle := lipgloss.NewStyle().Foreground(promptColour(d.info.Kind))
+	who, target := d.jobID, ""
 	if conn, ok := m.connByID(d.connID); ok {
-		who = boldStyle.Render(ansi.Truncate(conn.Label, w, "…")) + faintStyle.Render(ansi.Truncate("  "+conn.Target, max(0, w-lipgloss.Width(conn.Label)), "…"))
+		who, target = conn.Label, conn.Target+" · "
 	}
 	kind := map[jobs.PromptKind]string{jobs.PromptConfirm: "confirmation", jobs.PromptSecret: "password"}[d.info.Kind]
-	head := []string{who, lookAsking.String() + faintStyle.Render(" · "+or(kind, "text")), ""}
+	head := []string{mutedStyle.Render(ansi.Truncate(target, max(0, w-14), "…")) + kindStyle.Render("◆ "+or(kind, "text")), ""}
 
 	control := button("No", !d.yes) + "  " + button("Yes", d.yes)
 	if d.info.Kind != jobs.PromptConfirm {
 		in := d.input
 		in.Width, in.EchoCharacter = max(1, w-3), '•'
-		control = faintStyle.Render("› ") + in.View()
+		control = kindStyle.Bold(true).Render("› ") + in.View()
 	}
 	keep := []string{control}
 	if d.sending {
-		keep = append(keep, faintStyle.Render("sending…"))
+		keep = append(keep, mutedStyle.Render("sending…"))
 	} else if d.failure != "" {
 		keep = append(keep, redStyle.Render(fit(oneLine(d.failure), w)))
 	}
 	if rows <= len(keep) {
-		return limit(keep, rows)
+		return who, limit(keep, rows)
 	}
 
 	// Blank separators give way first, so the question may use their rows;
@@ -447,27 +560,29 @@ func (m model) promptLines(w, rows int) []string {
 	question := wrap(strings.TrimSpace(ansi.Strip(d.prompt)), w)
 	question = question[max(0, len(question)-max(1, rows-len(keep)-nonBlank(head))):]
 	top := squeeze(append(head, question...), rows-len(keep))
-	return squeeze(append(append(top, ""), keep...), rows)
+	return who, squeeze(append(append(top, ""), keep...), rows)
 }
 
+// button marks the selected choice with a pointer as well as the fill, so the
+// choice still shows on a terminal without colour.
 func button(label string, selected bool) string {
 	if selected {
-		return accentStyle.Bold(true).Render("[ " + label + " ]")
+		return badgeStyle.Render(" ▸ " + label + "  ")
 	}
-	return faintStyle.Render("  " + label + "  ")
+	return lipgloss.NewStyle().Background(capBg).Foreground(greyColor).Render("   " + label + "  ")
 }
 
 // View of the standalone prompt pane: the question alone, in the same frame.
 func (m promptModel) View() string {
-	body := []string{faintStyle.Render("Loading the question…")}
+	body := []string{mutedStyle.Render("Loading the question…")}
 	if m.dialog != nil {
-		body = m.promptLines(m.cols()-2, m.bodyRows())
+		body = box(m.cols()-2, m.bodyRows(), promptColour(m.dialog.info.Kind), m.promptLines)
 	} else if err := or(m.failure, or(m.link, m.config)); err != "" {
 		body = wrap(err, m.cols()-2)
 	}
-	summary := ""
+	var summary []string
 	if n := len(m.waiting()); n > 1 {
-		summary = fmt.Sprintf("%d questions waiting", n)
+		summary = []string{count(amberStyle, "◆", fmt.Sprint(n), "questions waiting")}
 	}
 	m.status = ""
 	return m.frame("SSH input", summary, body, nil, m.hints())

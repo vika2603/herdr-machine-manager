@@ -33,12 +33,11 @@ func TestConnLookDerivesOneStatePerConnection(t *testing.T) {
 }
 
 func TestConnLookPrefersTheJobInFlightOverAnOlderFailure(t *testing.T) {
-	m := model{outputs: map[string][]string{}}
-	m.mergeJobs([]jobs.Job{
+	m := send(newModel(context.Background(), nil), listMsg{Jobs: []jobs.Job{
 		{ID: "j1", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateFailed, Err: "boom"},
 		{ID: "j2", ConnID: "c1", Kind: jobs.KindDisconnect, State: jobs.StateRunning},
 		{ID: "j3", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateQueued},
-	})
+	}})
 	l, err := m.connLook(conn("c1", "One", "one", true))
 	if l.word != "disconnecting…" || err != "" {
 		t.Errorf("state = %q, error = %q; want the running job, not the one queued after it or the failure", l.word, err)
@@ -58,13 +57,60 @@ func TestMergeJobReplacesAndReportsTheOutcome(t *testing.T) {
 }
 
 func TestListTailsReplaceBufferedOutputAndDroppedJobsAreForgotten(t *testing.T) {
-	m := model{outputs: map[string][]string{"j1": {"stale"}, "gone": {"x"}}}
-	m.mergeJobs([]jobs.Job{{ID: "j1", State: jobs.StateRunning, Tail: []string{"one", "two"}}})
+	m := newModel(context.Background(), nil)
+	m.outputs = map[string][]string{"j1": {"stale"}, "gone": {"x"}}
+	m = send(m, listMsg{Jobs: []jobs.Job{{ID: "j1", State: jobs.StateRunning, Tail: []string{"one", "two"}}}})
 	if got := m.outputs["j1"]; len(got) != 2 || got[0] != "one" {
 		t.Errorf("outputs = %q, want the daemon's tail", got)
 	}
 	if _, ok := m.outputs["gone"]; ok {
 		t.Error("output of a job the daemon dropped was kept")
+	}
+}
+
+func TestReplyNeverUndoesWhatArrivedAfterItWasRequested(t *testing.T) {
+	queued := jobs.Job{ID: "j1", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateQueued, Tail: []string{"old"}}
+	asking := waitingJob("j1", "c1", "Enter code:")
+	conns := []daemon.Connection{conn("c1", "One", "one", false)}
+	m := send(newModel(context.Background(), nil), listMsg{Connections: conns, Revision: 3, Jobs: []jobs.Job{queued}})
+
+	// Output that streamed after the request outlasts the reply's tail.
+	asked := m.received
+	m = send(m, outputMsg{jobID: "j1", lines: []string{"streamed"}})
+	m = send(m, replyMsg{daemon.ListResult{Connections: conns, Revision: 3, Jobs: []jobs.Job{queued}}, asked})
+	if out := m.outputs["j1"]; out[len(out)-1] != "streamed" {
+		t.Errorf("the reply's tail replaced output that streamed after it was requested: %q", out)
+	}
+
+	// A list request goes out; a question and output arrive on the
+	// subscription; then the reply, with a snapshot taken before them.
+	asked = m.received
+	m = send(m, jobMsg(asking), outputMsg{jobID: "j1", lines: []string{"new"}})
+	m = send(m, replyMsg{daemon.ListResult{Connections: conns, Revision: 3, Jobs: []jobs.Job{queued}}, asked})
+	if m.dialog == nil || m.jobs[0].State != jobs.StateAwaitingInput || m.outputs["j1"][len(m.outputs["j1"])-1] != "new" {
+		t.Errorf("an older reply replaced newer state: dialog %v, jobs %+v, output %q", m.dialog != nil, m.jobs, m.outputs["j1"])
+	}
+
+	// A reply requested before a list the subscription delivered is dropped.
+	m = send(m, listMsg{Connections: conns, Revision: 4, Jobs: []jobs.Job{asking}})
+	m = send(m, replyMsg{daemon.ListResult{Revision: 4}, asked})
+	if len(m.conns) != 1 || len(m.jobs) != 1 {
+		t.Errorf("a reply older than the last list was applied: %d connections, %d jobs", len(m.conns), len(m.jobs))
+	}
+
+	// Of two replies, one with a lower revision than the list applied is dropped.
+	asked = m.received
+	m = send(m, replyMsg{daemon.ListResult{Connections: append(conns, conn("c2", "Two", "two", false)), Revision: 6, Jobs: []jobs.Job{asking}}, asked})
+	m = send(m, replyMsg{daemon.ListResult{Connections: conns, Revision: 5, Jobs: []jobs.Job{asking}}, asked})
+	if len(m.conns) != 2 {
+		t.Errorf("a list with an older revision replaced a newer one: %d connections", len(m.conns))
+	}
+
+	// A new subscription may reach a restarted daemon with lower revisions.
+	m = send(m, reconnectMsg{})
+	m = send(m, replyMsg{daemon.ListResult{Connections: conns, Revision: 1}, m.received})
+	if len(m.conns) != 1 || len(m.jobs) != 0 {
+		t.Errorf("the first list after reconnecting was not applied: %d connections, %d jobs", len(m.conns), len(m.jobs))
 	}
 }
 

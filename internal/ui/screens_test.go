@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/vika2603/herdr-machine-manager/internal/daemon"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
@@ -201,4 +206,145 @@ func TestWriteScreens(t *testing.T) {
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestWriteScreensHTML renders every screen in true colour, on a dark and on a
+// light background, into the standalone HTML page MM_UI_SCREENS_HTML names.
+// Each screen is shown at its first size: 100x26 for the manager, 64x13 for
+// the prompt pane, 40x10 for the smallest-pane screens.
+func TestWriteScreensHTML(t *testing.T) {
+	path := os.Getenv("MM_UI_SCREENS_HTML")
+	if path == "" {
+		t.Skip("MM_UI_SCREENS_HTML is not set")
+	}
+	profile, dark := lipgloss.ColorProfile(), lipgloss.HasDarkBackground()
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(profile)
+		lipgloss.SetHasDarkBackground(dark)
+	})
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	themes := []struct {
+		name, bg, fg string
+		dark         bool
+	}{{"dark", "#1e1e2e", "#cdd6f4", true}, {"light", "#fafafa", "#24242e", false}}
+
+	var b strings.Builder
+	b.WriteString(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>machine-manager screens</title>
+<style>
+body { margin: 24px; background: #8a8a96; font-family: -apple-system, system-ui, sans-serif; }
+h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px; color: #111; }
+.pair { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+pre { margin: 0; padding: 10px 12px; border-radius: 8px; font: 13px/1.15 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+</style></head><body>
+<h1 style="font-size:18px">machine-manager popup, rendered from View() in true colour</h1>
+`)
+	for _, s := range sampleScreens() {
+		w, h := s.sizes[0][0], s.sizes[0][1]
+		fmt.Fprintf(&b, "<h2>%s (%dx%d)</h2>\n<div class=\"pair\">\n", html.EscapeString(s.name), w, h)
+		for _, theme := range themes {
+			lipgloss.SetHasDarkBackground(theme.dark)
+			view := s.build(w, h).View()
+			for i, line := range strings.Split(view, "\n") {
+				if lipgloss.Width(line) > w {
+					t.Errorf("%s, %s: line %d is %d columns", s.name, theme.name, i, lipgloss.Width(line))
+				}
+			}
+			fmt.Fprintf(&b, "<pre style=\"width:%dch;background:%s;color:%s\">%s</pre>\n", w, theme.bg, theme.fg, ansiHTML(view, theme.fg, theme.bg))
+		}
+		b.WriteString("</div>\n")
+	}
+	b.WriteString("</body></html>\n")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var sgrPattern = regexp.MustCompile("\x1b\\[([0-9;?]*)([A-Za-z])")
+
+// ansiHTML converts the SGR sequences Lip Gloss writes in true colour (bold,
+// faint, underline, reverse, 24-bit foreground and background) to styled
+// spans, and drops every other control sequence.
+func ansiHTML(s, fg, bg string) string {
+	var b strings.Builder
+	var cur struct {
+		fg, bg                         string
+		bold, faint, underline, invert bool
+	}
+	emit := func(text string) {
+		if text == "" {
+			return
+		}
+		f, g := cur.fg, cur.bg
+		if cur.invert {
+			f, g = or(cur.bg, bg), or(cur.fg, fg)
+		}
+		var css []string
+		if f != "" {
+			css = append(css, "color:"+f)
+		}
+		if g != "" {
+			css = append(css, "background:"+g)
+		}
+		if cur.bold {
+			css = append(css, "font-weight:bold")
+		}
+		if cur.faint {
+			css = append(css, "opacity:0.6")
+		}
+		if cur.underline {
+			css = append(css, "text-decoration:underline")
+		}
+		if css == nil {
+			b.WriteString(html.EscapeString(text))
+			return
+		}
+		fmt.Fprintf(&b, "<span style=\"%s\">%s</span>", strings.Join(css, ";"), html.EscapeString(text))
+	}
+	rest := s
+	for _, loc := range sgrPattern.FindAllStringSubmatchIndex(s, -1) {
+		emit(s[len(s)-len(rest) : loc[0]])
+		rest = s[loc[1]:]
+		if s[loc[4]:loc[5]] != "m" {
+			continue
+		}
+		params := strings.Split(s[loc[2]:loc[3]], ";")
+		for i := 0; i < len(params); i++ {
+			switch n, _ := strconv.Atoi(params[i]); {
+			case n == 0:
+				cur.fg, cur.bg, cur.bold, cur.faint, cur.underline, cur.invert = "", "", false, false, false, false
+			case n == 1:
+				cur.bold = true
+			case n == 2:
+				cur.faint = true
+			case n == 22:
+				cur.bold, cur.faint = false, false
+			case n == 4:
+				cur.underline = true
+			case n == 24:
+				cur.underline = false
+			case n == 7:
+				cur.invert = true
+			case n == 27:
+				cur.invert = false
+			case n == 39:
+				cur.fg = ""
+			case n == 49:
+				cur.bg = ""
+			case (n == 38 || n == 48) && i+4 < len(params) && params[i+1] == "2":
+				r, _ := strconv.Atoi(params[i+2])
+				g, _ := strconv.Atoi(params[i+3])
+				bl, _ := strconv.Atoi(params[i+4])
+				colour := fmt.Sprintf("#%02x%02x%02x", r, g, bl)
+				if n == 38 {
+					cur.fg = colour
+				} else {
+					cur.bg = colour
+				}
+				i += 4
+			}
+		}
+	}
+	emit(rest)
+	return b.String()
 }

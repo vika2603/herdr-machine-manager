@@ -13,12 +13,13 @@ import (
 // call requests the connection list, through connections.list or the
 // connections.refresh that re-reads herdr first.
 func (m model) call(method string) tea.Cmd {
+	asked := m.received
 	return func() tea.Msg {
 		var result daemon.ListResult
 		if err := m.client.Call(m.ctx, method, nil, &result); err != nil {
 			return linkMsg(err.Error())
 		}
-		return listMsg(result)
+		return replyMsg{result, asked}
 	}
 }
 

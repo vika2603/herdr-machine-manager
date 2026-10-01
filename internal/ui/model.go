@@ -31,7 +31,16 @@ const (
 // outputLimit bounds the output buffered per job, as the daemon does.
 const outputLimit = 200
 
+// listMsg is a list the subscription delivered, in order with the job events
+// around it; replyMsg is the reply to a request, which travels apart from the
+// subscription and may be older than events that arrived before it. asked is
+// the number of subscription messages the model had received when it sent
+// the request.
 type listMsg daemon.ListResult
+type replyMsg struct {
+	daemon.ListResult
+	asked int
+}
 type aliasesMsg daemon.AliasesResult
 type jobMsg jobs.Job
 type outputMsg struct {
@@ -79,6 +88,15 @@ type model struct {
 
 	forget string
 
+	// received counts the messages the subscription delivered; listed,
+	// jobSeen and outSeen record the count at the last list and at the last
+	// update and output of each job, so a reply never undoes what arrived
+	// after it was requested. revision is that of the last list applied, and
+	// loaded tells whether one was.
+	received, listed, revision int
+	jobSeen, outSeen           map[string]int
+	loaded                     bool
+
 	dialog    *promptDialog
 	dismissed map[string]bool
 }
@@ -86,13 +104,15 @@ type model struct {
 func newModel(ctx context.Context, client *herdr.Client) model {
 	input := func(placeholder string) textinput.Model {
 		in := textinput.New()
-		in.Placeholder, in.Prompt, in.PlaceholderStyle = placeholder, "", faintStyle
+		in.Placeholder, in.Prompt, in.PlaceholderStyle = placeholder, "", mutedStyle
 		return in
 	}
 	return model{
 		ctx:     ctx,
 		client:  client,
 		outputs: map[string][]string{},
+		jobSeen: map[string]int{},
+		outSeen: map[string]int{},
 		filter:  input("type to filter"),
 		fields:  [3]textinput.Model{input("shown in the sidebar"), input("ssh alias or user@host"), input("default")},
 	}
@@ -111,22 +131,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode, m.back = map[bool]mode{true: modeList, false: m.mode}[m.mode == modeDetail], modeList
 		}
 	case listMsg:
-		c, _ := m.current()
-		selected := c.ID
-		m.conns, m.link = msg.Connections, msg.Error
-		m.cursor = clamp(m.cursor, len(m.conns))
-		if i := index(m.conns, func(c daemon.Connection) bool { return c.ID == selected }); i >= 0 {
-			m.cursor = i
+		m.received++
+		m.listed = m.received
+		m.applyList(daemon.ListResult(msg), m.received)
+	case replyMsg:
+		// A list the subscription delivered after the request is at least
+		// as new as the reply, and every later change follows it as an event.
+		if m.listed <= msg.asked {
+			m.applyList(msg.ListResult, msg.asked)
 		}
-		m.mergeJobs(msg.Jobs)
 	case aliasesMsg:
 		m.aliases = msg.Aliases
 		if msg.Error != "" {
 			m.link = msg.Error
 		}
 	case jobMsg:
+		m.received++
+		m.jobSeen[msg.ID] = m.received
 		m.mergeJob(jobs.Job(msg))
 	case outputMsg:
+		m.received++
+		m.outSeen[msg.jobID] = m.received
 		out := append(m.outputs[msg.jobID], msg.lines...)
 		m.outputs[msg.jobID] = out[max(0, len(out)-outputLimit):]
 	case statusMsg:
@@ -136,6 +161,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case linkMsg:
 		m.link = string(msg)
 	case reconnectMsg:
+		// A new subscription may reach a restarted daemon, whose revisions
+		// start again; replies requested before it are dropped.
+		m.received++
+		m.listed, m.revision = m.received, 0
 		return m, m.call(ipc.MethodList)
 	case promptReplyMsg:
 		if d := m.dialog; d != nil && d.jobID == msg.jobID && d.prompt == msg.prompt {
@@ -152,13 +181,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// mergeJobs replaces the known jobs with the set the daemon keeps. Its tails
-// replace what the popup buffered: the daemon saw everything, including what
-// streamed while this popup was disconnected from it.
-func (m *model) mergeJobs(list []jobs.Job) {
-	m.jobs = list
-	for _, job := range list {
-		if len(job.Tail) > 0 {
+// applyList takes the connections and jobs of a list unless a list with a
+// higher revision was applied. The list's jobs replace the known ones, and its
+// tails what the popup buffered: the daemon saw everything, including what
+// streamed while this popup was disconnected from it. A job update or output
+// the subscription delivered after asked is newer than the list and stays.
+func (m *model) applyList(list daemon.ListResult, asked int) {
+	if list.Revision < m.revision {
+		return
+	}
+	m.revision, m.loaded = list.Revision, true
+	c, _ := m.current()
+	selected := c.ID
+	m.conns, m.link = list.Connections, list.Error
+	m.cursor = clamp(m.cursor, len(m.conns))
+	if i := index(m.conns, func(c daemon.Connection) bool { return c.ID == selected }); i >= 0 {
+		m.cursor = i
+	}
+
+	merged := append([]jobs.Job(nil), list.Jobs...)
+	for i, job := range merged {
+		if current, ok := find(m.jobs, func(j jobs.Job) bool { return j.ID == job.ID }); ok && m.jobSeen[job.ID] > asked {
+			merged[i] = current
+		}
+	}
+	for _, job := range m.jobs {
+		if m.jobSeen[job.ID] > asked && index(merged, func(j jobs.Job) bool { return j.ID == job.ID }) < 0 {
+			merged = append(merged, job)
+		}
+	}
+	m.jobs = merged
+	for _, job := range merged {
+		if len(job.Tail) > 0 && m.outSeen[job.ID] <= asked {
 			m.outputs[job.ID] = job.Tail
 		}
 	}
@@ -180,12 +234,20 @@ func (m *model) mergeJob(job jobs.Job) {
 	m.forgetOutputs()
 }
 
-// forgetOutputs drops the output of jobs the daemon no longer keeps, then
-// lets the open question follow the jobs.
+// forgetOutputs drops what is kept about jobs the daemon no longer keeps,
+// then lets the open question follow the jobs.
 func (m *model) forgetOutputs() {
+	gone := func(id string) bool { return index(m.jobs, func(j jobs.Job) bool { return j.ID == id }) < 0 }
 	for id := range m.outputs {
-		if index(m.jobs, func(j jobs.Job) bool { return j.ID == id }) < 0 {
+		if gone(id) {
 			delete(m.outputs, id)
+		}
+	}
+	for _, seen := range []map[string]int{m.jobSeen, m.outSeen} {
+		for id := range seen {
+			if gone(id) {
+				delete(seen, id)
+			}
 		}
 	}
 	m.syncPrompt()

@@ -132,7 +132,6 @@ func (m model) keyPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // aside.
 type promptModel struct {
 	model
-	loaded bool
 }
 
 func (m promptModel) Init() tea.Cmd { return m.call(ipc.MethodList) }
@@ -146,9 +145,6 @@ func (m promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	next, cmd := m.model.Update(msg)
 	m.model = next.(model)
-	if _, ok := msg.(listMsg); ok {
-		m.loaded = true
-	}
 	if m.loaded && m.dialog == nil {
 		if cmd != nil {
 			return m, tea.Sequence(cmd, tea.Quit)

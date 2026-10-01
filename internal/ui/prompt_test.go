@@ -57,7 +57,7 @@ func TestQuestionWaitsWhileTheUserTypes(t *testing.T) {
 		if m.dialog != nil {
 			t.Fatalf("after %v: the question took focus from the input", c.setup)
 		}
-		if view := m.View(); !strings.Contains(view, "1 needs answer") || !strings.Contains(view, "ctrl+o answer") {
+		if view := m.View(); !strings.Contains(view, "1 needs answer") || !strings.Contains(view, "ctrl+o") {
 			t.Errorf("after %v: the waiting question is not indicated:\n%s", c.setup, view)
 		}
 		typed := m.filter.Value() + m.fields[0].Value()
@@ -195,7 +195,7 @@ func TestPromptPaneShowsOnlyTheQuestion(t *testing.T) {
 		Jobs:        []jobs.Job{waitingJob("job-1", "c1", "Continue? [y/N]")},
 	})
 	view := p.View()
-	for _, want := range []string{"Production", "Continue?", "No", "Yes", "esc later"} {
+	for _, want := range []string{"Production", "Continue?", "No", "Yes", "later"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("prompt pane is missing %q", want)
 		}
@@ -229,6 +229,13 @@ func TestPromptPaneClosesAfterTheLastQuestion(t *testing.T) {
 	}
 	if _, cmd = paneUpdate(t, p, keys("esc")...); !isQuit(cmd) {
 		t.Error("dismissing the last question did not close the pane")
+	}
+
+	// A reply requested before the subscription reopened is dropped, and
+	// the pane waits for the list that follows.
+	p, cmd = paneUpdate(t, promptModel{model: newModel(context.Background(), nil)}, reconnectMsg{}, replyMsg{daemon.ListResult{}, 0})
+	if isQuit(cmd) || p.loaded {
+		t.Error("the pane closed on a reply it dropped")
 	}
 
 	p = standalone(t, listMsg{Jobs: []jobs.Job{first}})

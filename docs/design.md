@@ -206,7 +206,11 @@ as they arrive, and submits requests. No `herdr machine` process is ever a child
 of the TUI, so no keystroke waits on one. The subscription does not replay what
 it missed, so every time it opens, including after the daemon was replaced or
 restarted, the TUI reads the list again; while it is down the TUI says so and
-retries every second. The daemon is started, when missing, before the TUI
+retries every second. A reply to a request travels apart from the
+subscription, so a list it carries can be older than events that arrived before
+it: the TUI drops a list with a lower revision than the last one applied, and a
+reply requested before a list the subscription delivered; job updates and
+output that arrived after the request stay. The daemon is started, when missing, before the TUI
 opens; the TUI does not start one later, because a popup of an older build would
 otherwise replace a newer daemon.
 
@@ -340,11 +344,22 @@ the screen, so the list stays in view and the work underneath — a half-filled
 form, a filter — survives a question arriving. Below 76 columns there is room
 for one column only: the panel replaces the list, and `enter` opens it.
 
-**One state vocabulary.** A state is a glyph, an ANSI colour and a word, the
-same in the list, the panel and the prompt: connected `●` green, disconnected
-`○` faint, queued `◌` and running `◐` blue, needs answer `◆` magenta, failed
-`✕` red. Secondary text is faint rather than grey and yellow is not used, so
-the popup reads on dark and light themes alike.
+**One state vocabulary.** A state is a glyph, a colour and a word, the same
+in the header counts, the list, the panel and the prompt: connected `●` green,
+disconnected `○` grey, queued `◌` and running `◐` blue, needs answer `◆` amber,
+failed `✕` red, and for the panel's last job succeeded `✓` green and cancelled
+`⊘` grey.
+
+**One palette.** Colours are `lipgloss.AdaptiveColor` pairs, one hex value for
+dark and one for light terminal backgrounds, each readable on its background;
+Lip Gloss picks the pair's variant from the terminal and degrades it on
+terminals with fewer colours. One violet accent marks focus and action: the
+title badge, the selected row's bar and tint, the focused form field, key caps,
+the selected button and the border of the add, edit and forget panels. The
+detail panel's border takes the selected connection's state colour, and a
+question's card is amber for a confirmation and pink for a password. Secondary
+text is grey; text without a role keeps the terminal's foreground. The selected
+choice of a confirmation also carries a pointer, so it shows without colour.
 
 **One key per action**, letters a first-time user can guess (`a` add, `e` edit,
 `d` forget, `x` cancel, `r` refresh), `space` to connect or disconnect, `enter`
@@ -360,14 +375,18 @@ same job keep the draft, and a dismissed question stays dismissed until the user
 opens it or a different one arrives. One that arrives while the user types in
 the alias picker or the form does not take focus, so keystrokes meant for the
 form never reach the answer: the header counts it and the hint line offers
-`ctrl+o`, and it opens once the form is saved or left. Confirmations start on
+`ctrl+o`, and it opens once the form is saved or the form or the picker is
+left. Confirmations start on
 No; secrets are masked.
 
-Every screen is laid out the same way — header with a summary, rule, body, rule
-carrying the status, one hint line — and is exactly the pane's size: the
-program does not use the alternate screen, so a taller frame would scroll its
-own top away. When rows run short, blank separators go first, then the output
-tail, then the lower settings; the selected row and the answer control stay.
+Every screen is laid out the same way — a header with the title badge and the
+state counts, a blank row, the body, a status line, one hint line — and is
+exactly the pane's size: the program does not use the alternate screen, so a
+taller frame would scroll its own top away. Panels are rounded boxes with their
+title set into the top edge, and a body under three rows drops the border.
+When rows run short, the detail panel gives up the output tail first, then the
+blank separators, then the lower settings; the header counts drop from the
+end; the selected row and the answer control stay.
 
 ## 8. Packages
 

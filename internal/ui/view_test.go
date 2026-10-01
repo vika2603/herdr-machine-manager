@@ -47,7 +47,7 @@ func TestSelectionStaysVisible(t *testing.T) {
 	m, _ = promptUpdate(t, m, tea.KeyMsg{Type: tea.KeyEnd})
 	m = sized(m, 40, 10)
 	m.status = "refreshed"
-	if view := m.View(); !strings.Contains(view, "❯ ◐ archive") {
+	if view := m.View(); !strings.Contains(view, "▌ ◐ archive") {
 		t.Errorf("the selected last connection is not on screen after shrinking:\n%s", view)
 	}
 }

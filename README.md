@@ -49,10 +49,12 @@ forgetting and answering a question take over the panel while the list stays
 in view. In a popup narrower than 76 columns the panel replaces the list, and
 `enter` opens the selected connection's details.
 
-Every state has one glyph and one word, used wherever it appears: `●`
-connected, `○` disconnected, `◌` queued, `◐` connecting or another job
-running, `◆` needs answer, `✕` failed (with the error). The bottom line lists
-the keys that apply right now; in a narrow popup it keeps the most important.
+Every state has one glyph, one colour and one word, used wherever it appears:
+`●` connected, `○` disconnected, `◌` queued, `◐` connecting or another job
+running, `◆` needs answer, `✕` failed (with the error); the panel's last job
+can also show `✓` succeeded or `⊘` cancelled. The header counts connections by
+state. The bottom line lists the keys that apply right now; in a narrow popup
+it keeps the most important.
 
 | Key | Action |
 | --- | --- |
@@ -64,14 +66,13 @@ the keys that apply right now; in a narrow popup it keeps the most important.
 | `d` | Forget the connection, after a confirmation |
 | `x` | Cancel the selected connection's unfinished job |
 | `r` | Re-read herdr's machine list |
-| `esc` | Close the popup, or step back from details, a form or a question |
+| `esc` | Close the popup, or step back from details, the alias picker, a form, the forget confirmation or a question |
 
 In the alias picker, typing filters by alias or host, `↑` / `↓` move, `enter`
 picks. Aliases already added are marked. When no alias matches, `enter` starts
 the form with the typed text, such as `user@host`, as SSH target and label. In
-the form, `tab` / `shift+tab` or
-`↓` / `↑` move between fields, `space` toggles the install switch, `enter`
-saves. The form shows the `herdr machine add` command it will run and warns
+the form, `tab` / `shift+tab` or `↓` / `↑` move between fields, `space` toggles
+the install switch, `enter` saves. The form shows the `herdr machine add` command it will run and warns
 when saving disconnects and reconnects an active connection. The forget
 confirmation says whether the connection is also removed from herdr; `enter`
 forgets, `esc` keeps it.
@@ -86,10 +87,12 @@ a question aside without answering or cancelling the job; it does not reopen by
 itself until a different question arrives, and `enter` on the connection opens
 it again. A question that arrives while you type in the alias picker or the form
 waits: the header counts it, `ctrl+o` opens it, and it opens by itself once you
-save or leave the form.
+save the form or leave the form or the picker.
 
 The install switch decides whether installing herdr on a remote that lacks it
-is allowed. When allowed, the installation still asks for confirmation; when
+is allowed. Connecting from the list with `space` follows the `install_remote`
+setting; the form's switch overrides it for the connect that saving starts.
+When allowed, the installation still asks for confirmation; when
 off, the daemon declines it. Replacing an incompatible remote server also asks.
 Passwords are never answered on your behalf.
 
