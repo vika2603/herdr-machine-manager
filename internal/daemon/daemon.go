@@ -290,12 +290,16 @@ func (d *Daemon) refresh(ctx context.Context, force bool) {
 	if err == nil {
 		conns = d.reconcile(actual)
 	}
-	d.mu.Lock()
-	changed := force || (err == nil && !slices.Equal(d.conns, conns))
-	d.cacheErr = ""
+	cacheErr := ""
 	if err != nil {
-		d.cacheErr = err.Error()
-	} else {
+		cacheErr = err.Error()
+	}
+	d.mu.Lock()
+	// The UI takes its error line from list events, so an error appearing or
+	// clearing is a change even when the connections are not.
+	changed := force || cacheErr != d.cacheErr || (err == nil && !slices.Equal(d.conns, conns))
+	d.cacheErr = cacheErr
+	if err == nil {
 		d.conns = conns
 	}
 	if changed {

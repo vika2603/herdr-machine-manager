@@ -117,7 +117,8 @@ in this repository lists the same settings.
 The connections live in `connections.json` under the plugin's state directory
 (`~/.local/state/herdr/plugins/herdr.machine-manager` by default), next to the
 daemon's socket and its log. A rebuilt daemon takes over on the next open
-once all background jobs have finished, so upgrades leave running commands alive.
+once all background jobs have finished, so upgrades leave running commands
+alive.
 herdr's own saved machines stay in
 `$XDG_STATE_HOME/herdr/client/endpoints.json`
 (`~/.local/state/herdr/client/endpoints.json` by default); this plugin only adds

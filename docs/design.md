@@ -29,9 +29,9 @@ target, explicit remote session, enabled flag — kept in
 (`~/.local/state/herdr/client/endpoints.json` by default), with the current
 selection beside it in `endpoint-selection.json`. `herdr machine list --json`
 reports them as `id`, `label`, `target`, `session`, `enabled` and `selected`;
-a profile id is 32 lowercase hexadecimal characters. These subcommands are parsed
-by hand, and the positional argument must precede the flags, whatever the clap-style ordering in
-`--help` suggests.
+a profile id is 32 lowercase hexadecimal characters. These subcommands are
+parsed by hand, and the positional argument must precede the flags, whatever
+the clap-style ordering in `--help` suggests.
 
 Two properties of that surface shape everything below:
 
@@ -313,8 +313,8 @@ The connection stays in the store either way — it is simply not active.
 The queue holds every unfinished job plus the last finished one per connection:
 the error a failed row shows, and the output its detail view shows. Each
 finished job replaces the previous finished job for its connection. There is no
-history to browse and no endpoint to read one from — `connections.list` carries that whole
-set, because it is small by construction.
+history to browse and no endpoint to read one from — `connections.list`
+carries that whole set, because it is small by construction.
 
 Output travels once: the list carries each job's tail, the progress events that
 follow carry only state, and the lines arrive separately as they are produced.
@@ -342,8 +342,8 @@ aliases, so the file is parsed for `Host` lines:
 from `ssh -G`, which prints the fully resolved configuration, rather than from
 reimplementing OpenSSH's precedence rules. Resolution uses up to eight workers,
 and a failure degrades to showing the alias alone. Enumeration and resolution
-run on each aliases request; there is no mtime or TTL cache. Default paths and tilde
-expansion are handled by the alias parser.
+run on each aliases request; there is no mtime or TTL cache. Default paths and
+tilde expansion are handled by the alias parser.
 
 ## 7. The interface
 
@@ -426,5 +426,5 @@ reconciliation with a fake `herdr`, `ui` over its state derivation.
   wrong answer.
 - **How long a reconnect takes** when the remote already has herdr, which is
   what decides whether disconnect/connect feels like a toggle or like a task.
-- **Whether a running herdr client reflects a machine change without a restart**,
-  which decides whether the popup has to say so after a connect.
+- **Whether a running herdr client reflects a machine change without a
+  restart**, which decides whether the popup has to say so after a connect.

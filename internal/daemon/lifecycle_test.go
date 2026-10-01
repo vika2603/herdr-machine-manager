@@ -97,7 +97,9 @@ func TestRefreshPublishesOnlyChangedConnectionsOrExplicitRequest(t *testing.T) {
 		{"explicit unchanged refresh", active, active, true, true},
 		{"endpoint removed", active, "[]", false, true},
 		{"another unchanged poll", "[]", "[]", false, false},
-		{"failed poll", "[]", "invalid", false, false},
+		{"failed poll", "[]", "invalid", false, true},
+		{"repeated failed poll", "invalid", "invalid", false, false},
+		{"recovered poll", "invalid", "[]", false, true},
 		{"explicit failed refresh", "[]", "invalid", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
