@@ -72,10 +72,10 @@ In the alias picker, typing filters by alias or host, `↑` / `↓` move, `enter
 picks. Aliases already added are marked. When no alias matches, `enter` starts
 the form with the typed text, such as `user@host`, as SSH target and label. In
 the form, `tab` / `shift+tab` or `↓` / `↑` move between fields, `space` toggles
-the install switch, `enter` saves. The form shows the `herdr machine add` command it will run and warns
-when saving disconnects and reconnects an active connection. The forget
-confirmation says whether the connection is also removed from herdr; `enter`
-forgets, `esc` keeps it.
+the install switch, `enter` saves. The form shows the `herdr machine add`
+command it will run and warns when saving disconnects and reconnects an active
+connection. The forget confirmation says whether the connection is also removed
+from herdr; `enter` forgets, `esc` keeps it.
 
 Connecting runs `herdr machine add`, which prepares the remote host and can take
 minutes. It runs in the background: the popup can be closed, and a herdr toast
@@ -89,12 +89,12 @@ it again. A question that arrives while you type in the alias picker or the form
 waits: the header counts it, `ctrl+o` opens it, and it opens by itself once you
 save the form or leave the form or the picker.
 
-The install switch decides whether installing herdr on a remote that lacks it
-is allowed. Connecting from the list with `space` follows the `install_remote`
-setting; the form's switch overrides it for the connect that saving starts.
-When allowed, the installation still asks for confirmation; when
-off, the daemon declines it. Replacing an incompatible remote server also asks.
-Passwords are never answered on your behalf.
+The install switch decides whether installing herdr on a remote that lacks it is
+allowed. Connecting from the list with `space` follows the `install_remote`
+setting; the form's switch overrides it for the connect that saving starts. When
+allowed, the installation still asks for confirmation; when off, the daemon
+declines it. Replacing an incompatible remote server also asks. Passwords are
+never answered on your behalf.
 
 A machine added outside the plugin, with `herdr machine add` on a command line,
 is adopted into the list rather than ignored.

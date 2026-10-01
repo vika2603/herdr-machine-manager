@@ -114,6 +114,17 @@ func TestReplyNeverUndoesWhatArrivedAfterItWasRequested(t *testing.T) {
 	}
 }
 
+func TestReplyKeepsAJobFirstSeenAfterItWasRequested(t *testing.T) {
+	conns := []daemon.Connection{conn("c1", "One", "one", false)}
+	m := send(newModel(context.Background(), nil), listMsg{Connections: conns, Revision: 2})
+	asked := m.received
+	m = send(m, jobMsg(waitingJob("j1", "c1", "Enter code:")))
+	m = send(m, replyMsg{daemon.ListResult{Connections: conns, Revision: 2}, asked})
+	if len(m.jobs) != 1 || m.dialog == nil {
+		t.Errorf("a reply older than a job's first event removed the job: jobs %+v, dialog open %v", m.jobs, m.dialog != nil)
+	}
+}
+
 func TestStreamedOutputIsBounded(t *testing.T) {
 	m := newModel(context.Background(), nil)
 	m.jobs = []jobs.Job{{ID: "j1", State: jobs.StateRunning}}

@@ -206,13 +206,13 @@ as they arrive, and submits requests. No `herdr machine` process is ever a child
 of the TUI, so no keystroke waits on one. The subscription does not replay what
 it missed, so every time it opens, including after the daemon was replaced or
 restarted, the TUI reads the list again; while it is down the TUI says so and
-retries every second. A reply to a request travels apart from the
-subscription, so a list it carries can be older than events that arrived before
-it: the TUI drops a list with a lower revision than the last one applied, and a
-reply requested before a list the subscription delivered; job updates and
-output that arrived after the request stay. The daemon is started, when missing, before the TUI
-opens; the TUI does not start one later, because a popup of an older build would
-otherwise replace a newer daemon.
+retries every second. A reply to a request travels apart from the subscription,
+so a list it carries can be older than events that arrived before it: the TUI
+drops a list with a lower revision than the last one applied, and a reply
+requested before a list the subscription delivered; job updates and output that
+arrived after the request stay. The daemon is started, when missing, before the
+TUI opens; the TUI does not start one later, because a popup of an older build
+would otherwise replace a newer daemon.
 
 Bubble Tea drives it, without the alternate screen: herdr destroys the popup
 pane when it closes, so there is no scrollback to protect, and staying on the
@@ -369,14 +369,13 @@ mode, most important first; a narrow popup drops hints from the end and keeps
 the way out.
 
 **Questions.** A waiting job's question opens in the panel of an open manager,
-or in the standalone prompt pane the daemon opens when no manager is
-subscribed. A question is identified by job and prompt text, so updates of the
-same job keep the draft, and a dismissed question stays dismissed until the user
-opens it or a different one arrives. One that arrives while the user types in
-the alias picker or the form does not take focus, so keystrokes meant for the
-form never reach the answer: the header counts it and the hint line offers
-`ctrl+o`, and it opens once the form is saved or the form or the picker is
-left. Confirmations start on
+or in the standalone prompt pane the daemon opens when no manager is subscribed.
+A question is identified by job and prompt text, so updates of the same job keep
+the draft, and a dismissed question stays dismissed until the user opens it or a
+different one arrives. One that arrives while the user types in the alias picker
+or the form does not take focus, so keystrokes meant for the form never reach
+the answer: the header counts it and the hint line offers `ctrl+o`, and it opens
+once the form is saved or the form or the picker is left. Confirmations start on
 No; secrets are masked.
 
 Every screen is laid out the same way — a header with the title badge and the

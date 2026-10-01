@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/vika2603/herdr-client/herdr"
 
+	"github.com/vika2603/herdr-machine-manager/internal/daemon"
 	"github.com/vika2603/herdr-machine-manager/internal/ipc"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 )
@@ -85,6 +86,28 @@ func TestPromptSendsSelectedAnswerToItsJob(t *testing.T) {
 				t.Errorf("sent %+v, dialog open = %v; want %q to target-job and the dialog closed", got, m.dialog != nil, tc.want)
 			}
 		})
+	}
+}
+
+// TestListRequestIsStampedWithWhatTheModelHadReceived goes through call: its
+// reply, a snapshot from before the question arrived, is delivered after the
+// subscription sent the question and a newer list, and must not undo them.
+func TestListRequestIsStampedWithWhatTheModelHadReceived(t *testing.T) {
+	queued := jobs.Job{ID: "j1", ConnID: "c1", Kind: jobs.KindConnect, State: jobs.StateQueued}
+	path := socketPath(t)
+	fakeDaemon(t, path, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		if method != ipc.MethodList {
+			return nil, ipc.Errorf(ipc.CodeUnknownMethod, "unexpected request")
+		}
+		return daemon.ListResult{Revision: 1, Jobs: []jobs.Job{queued}}, nil
+	})
+	m := send(newModel(context.Background(), herdr.New(path)), listMsg{Revision: 1, Jobs: []jobs.Job{queued}})
+	request := m.call(ipc.MethodList)
+	asking := waitingJob("j1", "c1", "Enter code:")
+	m = send(m, jobMsg(asking), listMsg{Revision: 1, Jobs: []jobs.Job{asking}})
+	m = send(m, request())
+	if m.dialog == nil || m.jobs[0].State != jobs.StateAwaitingInput {
+		t.Errorf("the reply to call undid newer state: jobs %+v, dialog open %v", m.jobs, m.dialog != nil)
 	}
 }
 
