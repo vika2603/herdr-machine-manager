@@ -21,7 +21,6 @@ type Handler func(ctx context.Context, method string, params json.RawMessage) (a
 // drops rather than blocking the daemon.
 const subscriberBuffer = 256
 
-// Server serves the daemon protocol on a unix socket.
 type Server struct {
 	ln      net.Listener
 	handler Handler
@@ -50,12 +49,9 @@ func Listen(path string, h Handler) (*Server, error) {
 	return &Server{ln: ln, handler: h, subs: map[chan wireEvent]struct{}{}}, nil
 }
 
-// Serve accepts connections until ctx ends or Close is called.
 func (s *Server) Serve(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
-		_ = s.ln.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = s.ln.Close() })
+	defer stop()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
@@ -74,12 +70,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// Close stops accepting and releases the socket.
 func (s *Server) Close() error { return s.ln.Close() }
 
-// Broadcast delivers an event to every open subscription. A full subscriber
-// buffer drops the event: events are advisory, and a client that misses one
-// re-reads the list.
 func (s *Server) Broadcast(name string, data any) {
 	ev := wireEvent{Event: name, Data: data}
 	s.mu.Lock()
@@ -92,30 +84,18 @@ func (s *Server) Broadcast(name string, data any) {
 	}
 }
 
-// HasSubscribers reports whether a plugin popup is currently listening for
-// job updates. Herdr allows only one popup at a time.
 func (s *Server) HasSubscribers() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.subs) > 0
 }
 
-// subscribers reports how many subscriptions are open, for tests that check
-// they are released.
-func (s *Server) subscribers() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.subs)
-}
-
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -124,7 +104,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 	var req wireRequest
 	if err := json.Unmarshal(line, &req); err != nil {
-		_ = writeLine(conn, reply("", nil, Errorf(CodeInvalidParams, "malformed request: %v", err)))
+		_ = json.NewEncoder(conn).Encode(reply("", nil, Errorf(CodeInvalidParams, "malformed request: %v", err)))
 		return
 	}
 	if req.Method == MethodSubscribe {
@@ -133,11 +113,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 
 	result, err := s.handler(ctx, req.Method, req.Params)
-	_ = writeLine(conn, reply(req.ID, result, err))
+	_ = json.NewEncoder(conn).Encode(reply(req.ID, result, err))
 }
 
-// serveSubscription holds the connection open, writing events until the client
-// disconnects or the daemon stops.
 func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *bufio.Reader, id string) {
 	ch := make(chan wireEvent, subscriberBuffer)
 	s.mu.Lock()
@@ -149,19 +127,14 @@ func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *b
 		s.mu.Unlock()
 	}()
 
-	if err := writeLine(conn, reply(id, map[string]string{"status": "subscribed"}, nil)); err != nil {
+	if err := json.NewEncoder(conn).Encode(reply(id, map[string]string{"status": "subscribed"}, nil)); err != nil {
 		return
 	}
 
-	// A subscriber sends nothing more; reading detects the disconnect.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
-		for {
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				return
-			}
-		}
+		_, _ = io.Copy(io.Discard, reader)
 	}()
 
 	for {
@@ -171,7 +144,7 @@ func (s *Server) serveSubscription(ctx context.Context, conn net.Conn, reader *b
 		case <-closed:
 			return
 		case ev := <-ch:
-			if err := writeLine(conn, ev); err != nil {
+			if err := json.NewEncoder(conn).Encode(ev); err != nil {
 				return
 			}
 		}
@@ -187,13 +160,4 @@ func reply(id string, result any, err error) wireResponse {
 		return wireResponse{ID: id, Error: e}
 	}
 	return wireResponse{ID: id, Result: result}
-}
-
-func writeLine(w io.Writer, v any) error {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(raw, '\n'))
-	return err
 }

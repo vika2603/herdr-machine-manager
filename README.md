@@ -108,7 +108,7 @@ in this repository lists the same settings.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `popup_width`, `popup_height` | `"55%"`, `"50%"` | Manager popup size. The standalone input popup uses its compact manifest size. |
-| `install_remote` | `true` | Starting position of the install switch in the form. |
+| `install_remote` | `true` | Allows installation for list connections and sets the form's initial choice. |
 | `ssh_config` | OpenSSH's default | Where the aliases are read from. |
 | `notifications` | `true` | Whether a finished or blocked job raises a herdr toast. |
 
@@ -116,9 +116,12 @@ in this repository lists the same settings.
 
 The connections live in `connections.json` under the plugin's state directory
 (`~/.local/state/herdr/plugins/herdr.machine-manager` by default), next to the
-daemon's socket and its log. herdr's own saved machines stay where herdr keeps
-them, in `~/.config/herdr/endpoints.json`; this plugin only adds to and removes
-from that list through `herdr machine`.
+daemon's socket and its log. A rebuilt daemon takes over on the next open
+once all background jobs have finished, so upgrades leave running commands alive.
+herdr's own saved machines stay in
+`$XDG_STATE_HOME/herdr/client/endpoints.json`
+(`~/.local/state/herdr/client/endpoints.json` by default); this plugin only adds
+to and removes from that list through `herdr machine`.
 
 ## Development
 

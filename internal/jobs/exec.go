@@ -2,23 +2,15 @@ package jobs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
-)
-
-// ptyCols and ptyRows are the terminal the command believes it has. A fixed
-// size keeps the output stable however the popup is resized: the TUI shows the
-// tail of it, it is not a terminal emulator.
-const (
-	ptyCols = 120
-	ptyRows = 40
 )
 
 // promptIdle is how long output has to stop, with an unterminated last line on
@@ -29,12 +21,9 @@ const promptIdle = 1500 * time.Millisecond
 // command can otherwise exhaust the daemon's memory by writing without '\n'.
 const maxPendingBytes = 4096
 
-// killGrace is how long a cancelled command has to act on SIGTERM before it is
-// killed. Without it a command that ignores the signal would hold its
-// connection's lane forever.
+// A command ignoring SIGTERM must eventually release its connection's queue.
 const killGrace = 5 * time.Second
 
-// Sink receives what a running command produces.
 type Sink struct {
 	// Lines reports complete output lines.
 	Lines func([]string)
@@ -45,25 +34,15 @@ type Sink struct {
 	Input <-chan string
 }
 
-// execute runs a job's command.
-func execute(ctx context.Context, spec Spec, sink Sink) (int, error) {
-	if spec.Run != nil {
-		if err := spec.Run(ctx, sink); err != nil {
-			return 1, err
-		}
-		return 0, nil
+func Exec(ctx context.Context, args []string, answers []Answer, sink Sink) error {
+	if len(args) == 0 {
+		return fmt.Errorf("jobs: empty command")
 	}
-	if len(spec.Args) == 0 {
-		return 0, errors.New("jobs: empty command")
-	}
-	return execPTY(ctx, spec, sink)
-}
-
-func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
-	cmd := exec.Command(spec.Args[0], spec.Args[1:]...)
-	f, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: ptyCols, Rows: ptyRows})
+	cmd := exec.Command(args[0], args[1:]...)
+	// Fixed dimensions keep command output stable as the popup resizes.
+	f, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 120, Rows: 40})
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -134,7 +113,7 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 				if rest := strings.TrimSpace(pending); rest != "" {
 					sink.Lines([]string{rest})
 				}
-				return exitStatus(cmd.Wait())
+				return cmd.Wait()
 			}
 			pending += chunk
 			if cut := strings.LastIndexByte(pending, '\n'); cut >= 0 {
@@ -150,15 +129,22 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 				}
 			}
 			if len(pending) > maxPendingBytes {
-				pending = pending[len(pending)-maxPendingBytes:]
+				start := len(pending) - maxPendingBytes
+				for start < len(pending) && !utf8.RuneStart(pending[start]) {
+					start++
+				}
+				pending = pending[start:]
 				if !truncated {
 					sink.Lines([]string{"[long output line truncated]"})
 					truncated = true
 				}
 			}
-			if reply, ok := matchAnswer(spec.Answers, pending); ok {
-				if err := answer(reply); err != nil {
-					return 0, err
+			for _, a := range answers {
+				if text := strings.TrimSpace(pending); text != "" && a.Match.MatchString(text) {
+					if err := answer(a.Reply); err != nil {
+						return err
+					}
+					break
 				}
 			}
 			idle.Reset(promptIdle)
@@ -172,34 +158,11 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 
 		case in := <-sink.Input:
 			if err := answer(in); err != nil {
-				return 0, err
+				return err
 			}
 			idle.Reset(promptIdle)
 		}
 	}
-}
-
-func matchAnswer(answers []Answer, text string) (string, bool) {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return "", false
-	}
-	for _, a := range answers {
-		if a.Match.MatchString(trimmed) {
-			return a.Reply, true
-		}
-	}
-	return "", false
-}
-
-// exitStatus turns what cmd.Wait reported into an exit code, so that a command
-// that ran and failed is told apart from one that could not run.
-func exitStatus(err error) (int, error) {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode(), nil
-	}
-	return 0, err
 }
 
 func splitLines(s string) []string {

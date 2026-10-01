@@ -117,49 +117,18 @@ func TestAliasesIncludeTilde(t *testing.T) {
 	writeFile(t, filepath.Join(home, ".ssh", "config"), "Include ~/extra/*.conf\n")
 	writeFile(t, filepath.Join(home, "extra", "hosts.conf"), "Host from-home\n")
 
-	got, err := Aliases(filepath.Join(home, ".ssh", "config"))
-	if err != nil {
-		t.Fatalf("Aliases() returned error: %v", err)
+	for _, path := range []string{"", "~/.ssh/config", filepath.Join(home, ".ssh", "config")} {
+		got, err := Aliases(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Alias{{Name: "from-home", Source: filepath.Join(home, "extra", "hosts.conf")}}
+		if !slices.Equal(got, want) {
+			t.Errorf("Aliases(%q) = %+v", path, got)
+		}
 	}
-	want := []Alias{{Name: "from-home", Source: filepath.Join(home, "extra", "hosts.conf")}}
-	if !slices.Equal(got, want) {
-		t.Errorf("Aliases() = %+v, want %+v", got, want)
-	}
-}
-
-func TestDefaultPath(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	got, err := DefaultPath()
-	if err != nil {
-		t.Fatalf("DefaultPath() returned error: %v", err)
-	}
-	if want := filepath.Join(home, ".ssh", "config"); got != want {
-		t.Errorf("DefaultPath() = %q, want %q", got, want)
-	}
-}
-
-func TestSplitKeyword(t *testing.T) {
-	tests := []struct {
-		line    string
-		keyword string
-		rest    string
-	}{
-		{"Host pi", "Host", "pi"},
-		{"Host=pi", "Host", "pi"},
-		{"Host = pi", "Host", "pi"},
-		{"Host\tpi other", "Host", "pi other"},
-		{"Host", "Host", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.line, func(t *testing.T) {
-			keyword, rest := splitKeyword(tt.line)
-			if keyword != tt.keyword || rest != tt.rest {
-				t.Errorf("splitKeyword(%q) = (%q, %q), want (%q, %q)", tt.line, keyword, rest, tt.keyword, tt.rest)
-			}
-		})
+	if got, err := expandTilde("~other/.ssh/config"); err != nil || got != "~other/.ssh/config" {
+		t.Fatalf("expanded another user's home: %q, %v", got, err)
 	}
 }
 

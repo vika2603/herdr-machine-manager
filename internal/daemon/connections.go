@@ -1,25 +1,16 @@
 package daemon
 
 import (
-	"context"
-
 	"github.com/vika2603/herdr-machine-manager/internal/machines"
 	"github.com/vika2603/herdr-machine-manager/internal/store"
 )
 
-// Connection is a stored connection plus whether herdr currently holds it.
-// Active is derived from herdr's own list rather than stored, so the two can
-// never disagree: the plugin uses `machine add` and `machine remove` and
-// nothing else of herdr's machine state.
+// Active is derived from Herdr's list, never persisted separately.
 type Connection struct {
 	store.Connection
 	Active bool `json:"active"`
 }
 
-// reconcile merges the store with what herdr reports. It records the herdr
-// endpoint id of a connection that is active, clears it for one that is not,
-// and adopts a machine added outside the plugin so that it is manageable here
-// instead of invisible.
 func (d *Daemon) reconcile(actual []machines.Machine) []Connection {
 	stored := d.store.List()
 	taken := make(map[string]bool, len(actual))
@@ -42,26 +33,23 @@ func (d *Daemon) reconcile(actual []machines.Machine) []Connection {
 	for _, conn := range stored {
 		machine, ok := matched[conn.ID]
 		if !ok {
-			machine, ok = matchMachine(actual, conn, taken)
+			for _, candidate := range actual {
+				if !taken[candidate.ID] && candidate.Target == conn.Target && candidate.Label == conn.Label {
+					machine, ok = candidate, true
+					break
+				}
+			}
 		}
 		if ok {
 			taken[machine.ID] = true
-			if conn.ProfileID != machine.ID {
-				conn.ProfileID = machine.ID
-				if saved, err := d.store.Put(conn); err == nil {
-					conn = saved
-				}
-			}
-			out = append(out, Connection{Connection: conn, Active: true})
-			continue
 		}
-		if conn.ProfileID != "" {
-			conn.ProfileID = ""
+		if conn.ProfileID != machine.ID {
+			conn.ProfileID = machine.ID
 			if saved, err := d.store.Put(conn); err == nil {
 				conn = saved
 			}
 		}
-		out = append(out, Connection{Connection: conn, Active: false})
+		out = append(out, Connection{Connection: conn, Active: ok})
 	}
 
 	for _, machine := range actual {
@@ -80,44 +68,4 @@ func (d *Daemon) reconcile(actual []machines.Machine) []Connection {
 		out = append(out, Connection{Connection: adopted, Active: true})
 	}
 	return out
-}
-
-// matchMachine pairs an unmatched stored connection by target and label,
-// after existing endpoint IDs have been reserved for their owners.
-func matchMachine(actual []machines.Machine, conn store.Connection, taken map[string]bool) (machines.Machine, bool) {
-	for _, machine := range actual {
-		if !taken[machine.ID] && machine.Target == conn.Target && machine.Label == conn.Label {
-			return machine, true
-		}
-	}
-	return machines.Machine{}, false
-}
-
-// connection returns one merged connection.
-func (d *Daemon) connection(id string) (Connection, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for _, conn := range d.conns {
-		if conn.ID == id {
-			return conn, true
-		}
-	}
-	return Connection{}, false
-}
-
-// reloadOnce reads herdr's list and reconciles it. The caller holds d.reload.
-func (d *Daemon) reloadOnce(ctx context.Context) []Connection {
-	list, err := d.cli.List(ctx)
-	if err != nil {
-		d.mu.Lock()
-		d.cacheErr = err.Error()
-		d.mu.Unlock()
-		return nil
-	}
-	conns := d.reconcile(list)
-	d.mu.Lock()
-	d.cacheErr = ""
-	d.conns = conns
-	d.mu.Unlock()
-	return conns
 }

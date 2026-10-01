@@ -6,47 +6,21 @@ import (
 	"fmt"
 	"slices"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-// laneDepth bounds how many jobs can wait on one connection. A connection has
-// at most a disconnect and a connect in flight, so reaching this means
-// something is submitting in a loop.
-const laneDepth = 8
-
-// laneIdle is how long a connection's worker waits with nothing to do before
-// it retires, so that connections seen once do not each keep a goroutine.
-const laneIdle = time.Minute
-
-// ErrNotFound is returned for an unknown job id.
 var ErrNotFound = errors.New("jobs: no such job")
 
-// ErrNotWaiting is returned when input arrives for a job that is not asking
-// for any.
 var ErrNotWaiting = errors.New("jobs: the job is not waiting for input")
 
-// Queue runs jobs and reports what they are doing.
-//
-// Jobs are serialized per connection and run in parallel across connections:
-// preparing a remote host takes minutes and two of them have no reason to wait
-// for each other, while the two jobs of a reconnect must stay in order.
-//
-// Nothing is kept for browsing. The queue holds the jobs that have not
-// finished plus the last finished one per connection, which is the error a row
-// shows and the output its detail view shows.
 type Queue struct {
 	ctx   context.Context
 	hooks Hooks
-	ids   atomic.Uint64
+	ids   uint64
 
-	mu    sync.Mutex
-	order []string
-	byID  map[string]*state
-	lanes map[string]chan string
+	mu   sync.Mutex
+	jobs []*state
 }
 
-// NewQueue builds a queue whose jobs run under ctx.
 func NewQueue(ctx context.Context, hooks Hooks) *Queue {
 	if hooks.OnUpdate == nil {
 		hooks.OnUpdate = func(Job) {}
@@ -57,89 +31,61 @@ func NewQueue(ctx context.Context, hooks Hooks) *Queue {
 	return &Queue{
 		ctx:   ctx,
 		hooks: hooks,
-		byID:  map[string]*state{},
-		lanes: map[string]chan string{},
 	}
 }
 
-// Submit accepts a job and returns it in its queued state.
-func (q *Queue) Submit(spec Spec) (Job, error) {
-	jobs, err := q.SubmitBatch(spec)
-	if err != nil {
-		return Job{}, err
-	}
-	return jobs[0], nil
-}
-
-// SubmitBatch queues jobs for one connection atomically: a reconnect must
-// never enqueue its disconnect unless there is room for its connect too.
-func (q *Queue) SubmitBatch(specs ...Spec) ([]Job, error) {
-	if len(specs) == 0 {
-		return nil, nil
-	}
+func (q *Queue) Submit(connID string, spec Spec) Job {
 	q.mu.Lock()
-	if err := q.ctx.Err(); err != nil {
-		q.mu.Unlock()
-		return nil, err
-	}
-	connID := specs[0].ConnID
-	for _, spec := range specs[1:] {
-		if spec.ConnID != connID {
-			q.mu.Unlock()
-			return nil, errors.New("jobs: batch spans multiple connections")
+	var previous <-chan struct{}
+	for i := len(q.jobs) - 1; i >= 0; i-- {
+		if q.jobs[i].job.ConnID == connID {
+			previous = q.jobs[i].done
+			break
 		}
 	}
-	// Registering jobs and handing them to the worker happen under one lock.
-	// The worker retires under that lock, so no job goes to an idle channel.
-	lane := q.lane(connID)
-	if len(specs) > cap(lane)-len(lane) {
-		q.mu.Unlock()
-		return nil, fmt.Errorf("jobs: %s already has too many jobs queued (limit %d)", specs[0].Title, laneDepth)
+	q.ids++
+	ctx, cancel := context.WithCancel(q.ctx)
+	st := &state{
+		ctx: ctx, cancel: cancel,
+		job:   Job{ID: fmt.Sprintf("job-%d", q.ids), Kind: spec.Kind, Title: spec.Title, ConnID: connID, State: StateQueued},
+		spec:  spec,
+		input: make(chan string, 1),
+		done:  make(chan struct{}),
 	}
-	out := make([]Job, 0, len(specs))
-	for _, spec := range specs {
-		id := fmt.Sprintf("job-%d", q.ids.Add(1))
-		st := &state{
-			job:   Job{ID: id, Kind: spec.Kind, Title: spec.Title, ConnID: spec.ConnID, State: StateQueued},
-			spec:  spec,
-			input: make(chan string, 1),
-		}
-		q.byID[id] = st
-		q.order = append(q.order, id)
-		lane <- id
-		out = append(out, st.event())
-	}
+	q.jobs = append(q.jobs, st)
+	event := st.event()
 	q.mu.Unlock()
-	for _, job := range out {
-		q.hooks.OnUpdate(job)
-	}
-	return out, nil
+	q.hooks.OnUpdate(event)
+	go func() {
+		if previous != nil {
+			<-previous
+		}
+		q.run(st)
+		close(st.done)
+	}()
+	return event
 }
 
-// List returns the jobs the queue still holds, oldest first, each with the
-// tail of its output.
 func (q *Queue) List() []Job {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	out := make([]Job, 0, len(q.order))
-	for _, id := range q.order {
-		if st, ok := q.byID[id]; ok {
-			out = append(out, st.snapshot())
-		}
+	out := make([]Job, 0, len(q.jobs))
+	for _, st := range q.jobs {
+		job := st.job
+		job.Tail = slices.Clone(job.Tail)
+		out = append(out, job)
 	}
 	return out
 }
 
-// Input forwards what the user typed to a job waiting on a prompt.
 func (q *Queue) Input(id, data string) error {
 	q.mu.Lock()
-	st, ok := q.byID[id]
-	waiting := ok && st.job.State == StateAwaitingInput
-	q.mu.Unlock()
-	if !ok {
+	defer q.mu.Unlock()
+	st := q.find(id)
+	if st == nil {
 		return ErrNotFound
 	}
-	if !waiting {
+	if st.job.State != StateAwaitingInput {
 		return ErrNotWaiting
 	}
 	select {
@@ -150,159 +96,74 @@ func (q *Queue) Input(id, data string) error {
 	}
 }
 
-// Cancel stops a job, whether it is running or still queued.
 func (q *Queue) Cancel(id string) error {
 	q.mu.Lock()
-	st, ok := q.byID[id]
-	if !ok {
-		q.mu.Unlock()
+	defer q.mu.Unlock()
+	st := q.find(id)
+	if st == nil {
 		return ErrNotFound
 	}
-	// A job that has not started yet has no context to cancel; the flag is
-	// what its lane sees when it picks it up.
-	st.cancelled = true
-	cancel := st.cancel
-	q.mu.Unlock()
+	st.cancel()
+	return nil
+}
 
-	if cancel != nil {
-		cancel()
+// find returns a retained job. The caller holds the lock.
+func (q *Queue) find(id string) *state {
+	for _, st := range q.jobs {
+		if st.job.ID == id {
+			return st
+		}
 	}
 	return nil
 }
 
-// lane returns the channel that serializes one connection's jobs, starting its
-// worker the first time the connection is used. The caller holds the lock.
-func (q *Queue) lane(connID string) chan string {
-	if ch, ok := q.lanes[connID]; ok {
-		return ch
-	}
-	ch := make(chan string, laneDepth)
-	q.lanes[connID] = ch
-	go q.serveLane(connID, ch)
-	return ch
-}
-
-// serveLane runs one connection's jobs in order and retires when the
-// connection has been idle, so a daemon that outlives many connections does
-// not accumulate goroutines.
-func (q *Queue) serveLane(connID string, ch chan string) {
-	idle := time.NewTimer(laneIdle)
-	defer idle.Stop()
-	for {
-		select {
-		case <-q.ctx.Done():
-			return
-		case id := <-ch:
-			q.run(id)
-			idle.Reset(laneIdle)
-		case <-idle.C:
-			q.mu.Lock()
-			if len(ch) == 0 && q.lanes[connID] == ch {
-				delete(q.lanes, connID)
-				q.mu.Unlock()
-				return
-			}
-			q.mu.Unlock()
-			idle.Reset(laneIdle)
-		}
-	}
-}
-
-func (q *Queue) run(id string) {
-	q.mu.Lock()
-	st, ok := q.byID[id]
-	if !ok {
-		q.mu.Unlock()
+func (q *Queue) run(st *state) {
+	defer st.cancel()
+	if st.ctx.Err() != nil {
+		q.update(st, StateCancelled, "", nil)
 		return
 	}
-	if st.cancelled {
-		q.mu.Unlock()
-		q.finish(id, StateCancelled, nil)
-		return
-	}
-	ctx, cancel := context.WithCancel(q.ctx)
-	defer cancel()
-	st.cancel = cancel
-	st.job.State = StateRunning
-	spec := st.spec
-	event := st.event()
-	q.mu.Unlock()
-	q.hooks.OnUpdate(event)
-
-	sink := Sink{
+	q.update(st, StateRunning, "", nil)
+	err := st.spec.Run(st.ctx, Sink{
 		Lines: func(lines []string) {
 			q.mu.Lock()
-			st.appendLines(lines)
+			st.job.Tail = append(st.job.Tail, lines...)
+			if len(st.job.Tail) > tailLines {
+				st.job.Tail = slices.Clone(st.job.Tail[len(st.job.Tail)-tailLines:])
+			}
 			q.mu.Unlock()
-			q.hooks.OnOutput(id, lines)
+			q.hooks.OnOutput(st.job.ID, lines)
 		},
 		Prompt: func(text string) {
-			q.mu.Lock()
-			switch {
-			case text != "":
-				st.job.State, st.job.Prompt = StateAwaitingInput, text
-			case st.job.State == StateAwaitingInput:
-				st.job.State, st.job.Prompt = StateRunning, ""
-			default:
-				q.mu.Unlock()
-				return
+			phase := StateRunning
+			if text != "" {
+				phase = StateAwaitingInput
 			}
-			event := st.event()
-			q.mu.Unlock()
-			q.hooks.OnUpdate(event)
+			q.update(st, phase, text, nil)
 		},
 		Input: st.input,
+	})
+	phase := StateSucceeded
+	if st.ctx.Err() != nil {
+		phase, err = StateCancelled, nil
+	} else if err != nil {
+		phase = StateFailed
 	}
-
-	code, err := execute(ctx, spec, sink)
-	switch {
-	case ctx.Err() != nil && q.ctx.Err() == nil:
-		q.finish(id, StateCancelled, nil)
-	case err != nil:
-		q.finish(id, StateFailed, err)
-	case code != 0:
-		q.finish(id, StateFailed, fmt.Errorf("exit status %d", code))
-	default:
-		q.finish(id, StateSucceeded, nil)
-	}
+	q.update(st, phase, "", err)
 }
 
-func (q *Queue) finish(id string, s State, err error) {
+func (q *Queue) update(st *state, phase State, prompt string, err error) {
 	q.mu.Lock()
-	st, ok := q.byID[id]
-	if !ok {
-		q.mu.Unlock()
-		return
-	}
-	st.job.State = s
-	st.job.Prompt = ""
+	st.job.State, st.job.Prompt = phase, prompt
 	if err != nil {
 		st.job.Err = err.Error()
 	}
+	if phase.Terminal() {
+		q.jobs = slices.DeleteFunc(q.jobs, func(other *state) bool {
+			return other != st && other.job.ConnID == st.job.ConnID && other.job.State.Terminal()
+		})
+	}
 	event := st.event()
-	q.prune()
 	q.mu.Unlock()
 	q.hooks.OnUpdate(event)
-}
-
-// prune drops every finished job but the latest of each connection. The caller
-// holds the lock.
-func (q *Queue) prune() {
-	latest := make(map[string]string, len(q.order))
-	for _, id := range q.order {
-		if st, ok := q.byID[id]; ok && st.job.State.Terminal() {
-			latest[st.job.ConnID] = id
-		}
-	}
-	q.order = slices.DeleteFunc(q.order, func(id string) bool {
-		st, ok := q.byID[id]
-		if !ok {
-			return true
-		}
-		if st.job.State.Terminal() && latest[st.job.ConnID] != id {
-			delete(q.byID, id)
-			return true
-		}
-		return false
-	})
 }

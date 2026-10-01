@@ -4,20 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/vika2603/herdr-client/herdr"
 )
 
-// The client side of this protocol is herdr-client, so the tests use it: they
-// prove the server speaks what herdr itself speaks, not merely what a matching
-// handwritten client would accept.
-// socketPath keeps the socket short: a unix socket path is limited to about
-// 100 bytes, and the per-test temp directory is already most of that.
 func socketPath(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "ipc")
@@ -28,10 +24,11 @@ func socketPath(t *testing.T) string {
 	return filepath.Join(dir, "s.sock")
 }
 
-func serve(t *testing.T, h Handler) *herdr.Client {
+// Exercise the wire protocol through the same client the popup uses.
+func serve(t *testing.T, h Handler) (*Server, *herdr.Client) {
 	t.Helper()
 	path := socketPath(t)
-	server, err := Listen(path, h)
+	s, err := Listen(path, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,193 +36,68 @@ func serve(t *testing.T, h Handler) *herdr.Client {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := server.Serve(ctx); err != nil {
+		if err := s.Serve(ctx); err != nil {
 			t.Error(err)
 		}
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-	t.Cleanup(func() { _ = server.Close() })
-	return herdr.New(path)
+	t.Cleanup(func() { cancel(); <-done })
+	return s, herdr.New(path)
 }
 
-func TestCallDecodesResult(t *testing.T) {
-	client := serve(t, func(_ context.Context, method string, params json.RawMessage) (any, error) {
-		if method != "echo" {
-			return nil, Errorf(CodeUnknownMethod, "unknown method %q", method)
+func TestCallResultAndErrors(t *testing.T) {
+	_, client := serve(t, func(_ context.Context, method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "echo":
+			var p struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(params, &p); err != nil {
+				return nil, Errorf(CodeInvalidParams, "%v", err)
+			}
+			return p, nil
+		case "missing":
+			return nil, Errorf(CodeNotFound, "no connection")
+		default:
+			return nil, errors.New("something broke")
 		}
-		var in struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(params, &in); err != nil {
-			return nil, Errorf(CodeInvalidParams, "%v", err)
-		}
-		return map[string]string{"text": in.Text}, nil
 	})
-
 	var out struct {
 		Text string `json:"text"`
 	}
-	if err := client.Call(context.Background(), "echo", map[string]string{"text": "hello"}, &out); err != nil {
-		t.Fatal(err)
+	if err := client.Call(context.Background(), "echo", map[string]string{"text": "hello"}, &out); err != nil || out.Text != "hello" {
+		t.Fatalf("echo = %+v, %v", out, err)
 	}
-	if out.Text != "hello" {
-		t.Errorf("text = %q, want hello", out.Text)
-	}
-}
-
-func TestCallReportsErrorCode(t *testing.T) {
-	client := serve(t, func(context.Context, string, json.RawMessage) (any, error) {
-		return nil, Errorf(CodeNotFound, "no connection %q", "c1")
-	})
-
-	err := client.Call(context.Background(), "connection.connect", struct{}{}, nil)
-	if err == nil {
-		t.Fatal("Call succeeded, want an error")
-	}
-	var apiErr *herdr.Error
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("error %v is not a *herdr.Error, so the wire shape does not match herdr's", err)
-	}
-	if apiErr.Code != CodeNotFound {
-		t.Errorf("code = %q, want %q", apiErr.Code, CodeNotFound)
-	}
-}
-
-func TestHandlerErrorBecomesInternal(t *testing.T) {
-	client := serve(t, func(context.Context, string, json.RawMessage) (any, error) {
-		return nil, errors.New("something broke")
-	})
-
-	err := client.Call(context.Background(), "whatever", struct{}{}, nil)
-	var apiErr *herdr.Error
-	if !errors.As(err, &apiErr) || apiErr.Code != CodeInternal {
-		t.Fatalf("error = %v, want code %s", err, CodeInternal)
-	}
-	if apiErr.Message != "something broke" {
-		t.Errorf("message = %q, want the handler's own", apiErr.Message)
-	}
-}
-
-func TestSubscriptionReceivesBroadcasts(t *testing.T) {
-	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		return map[string]string{"status": "ok"}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = server.Serve(ctx) }()
-
-	client := herdr.New(path)
-	stream, err := client.OpenStream(ctx, MethodSubscribe, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = stream.Close() }()
-
-	// The subscription is registered by the time the acknowledgement arrives,
-	// so a broadcast after it cannot be missed.
-	server.Broadcast(EventJobUpdated, map[string]string{"id": "job-1"})
-
-	read, cancelRead := context.WithTimeout(ctx, 2*time.Second)
-	defer cancelRead()
-	event, err := stream.Next(read)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event.Event != EventJobUpdated {
-		t.Errorf("event = %q, want %q", event.Event, EventJobUpdated)
-	}
-	var data struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(event.Data, &data); err != nil {
-		t.Fatal(err)
-	}
-	if data.ID != "job-1" {
-		t.Errorf("data.id = %q, want job-1", data.ID)
-	}
-}
-
-func TestBroadcastReachesEverySubscriber(t *testing.T) {
-	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		return struct{}{}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = server.Serve(ctx) }()
-
-	const subscribers = 3
-	var wg sync.WaitGroup
-	errs := make(chan error, subscribers)
-	for range subscribers {
-		stream, err := herdr.New(path).OpenStream(ctx, MethodSubscribe, nil)
-		if err != nil {
-			t.Fatal(err)
+	for _, tc := range []struct{ method, code, message string }{
+		{"missing", CodeNotFound, "no connection"},
+		{"broken", CodeInternal, "something broke"},
+	} {
+		err := client.Call(context.Background(), tc.method, nil, nil)
+		var apiErr *herdr.Error
+		if !errors.As(err, &apiErr) || apiErr.Code != tc.code || apiErr.Message != tc.message {
+			t.Errorf("%s error = %v, want %s: %s", tc.method, err, tc.code, tc.message)
 		}
-		defer func() { _ = stream.Close() }()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			read, cancelRead := context.WithTimeout(ctx, 2*time.Second)
-			defer cancelRead()
-			if _, err := stream.Next(read); err != nil {
-				errs <- err
-			}
-		}()
-	}
-
-	server.Broadcast(EventConnectionsChanged, map[string]int{"revision": 2})
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
 	}
 }
 
 func TestMalformedRequestIsRejected(t *testing.T) {
-	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		t.Error("the handler ran for a malformed request")
+	_, client := serve(t, func(context.Context, string, json.RawMessage) (any, error) {
+		t.Error("handler ran for a malformed request")
 		return nil, nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = server.Serve(ctx) }()
-
-	conn, err := dialUnix(path)
+	conn, err := net.Dial("unix", client.SocketPath())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	if _, err := conn.Write([]byte("{not json\n")); err != nil {
+	if _, err := io.WriteString(conn, "{not json\n"); err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var resp struct {
-		Error *failure `json:"error"`
-	}
-	if err := json.Unmarshal(buf[:n], &resp); err != nil {
+	var resp wireResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
-		t.Errorf("response = %s, want code %s", buf[:n], CodeInvalidParams)
+		t.Fatalf("response = %+v, want %s", resp, CodeInvalidParams)
 	}
 }
 
@@ -235,113 +107,101 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	first.ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The file survives Close, and a daemon that crashed leaves one behind.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
 	second, err := Listen(path, nil)
 	if err != nil {
-		t.Fatalf("Listen did not replace the stale socket: %v", err)
+		t.Fatal(err)
 	}
-	_ = second.Close()
+	defer func() { _ = second.Close() }()
 }
 
-func TestSubscriberIsRemovedWhenTheClientLeaves(t *testing.T) {
-	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		return struct{}{}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
+func TestSubscriptionBroadcastAndCleanup(t *testing.T) {
+	s, client := serve(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	go func() { _ = server.Serve(ctx) }()
-
-	stream, err := herdr.New(path).OpenStream(ctx, MethodSubscribe, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := server.subscribers(); n != 1 {
-		t.Fatalf("subscribers = %d, want 1", n)
-	}
-	_ = stream.Close()
-
-	// A daemon runs for as long as herdr does, so a subscription that outlives
-	// its popup would accumulate silently.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if server.subscribers() == 0 {
-			return
+	var streams []*herdr.Stream
+	for range 2 {
+		stream, err := client.OpenStream(ctx, MethodSubscribe, nil)
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(20 * time.Millisecond)
+		defer func() { _ = stream.Close() }()
+		streams = append(streams, stream)
 	}
-	t.Fatalf("subscribers = %d after the client left, want 0", server.subscribers())
+	if !s.HasSubscribers() {
+		t.Fatal("subscriber was not registered before acknowledgement")
+	}
+	s.Broadcast(EventJobUpdated, map[string]string{"id": "job-1"})
+	for _, stream := range streams {
+		ev, err := stream.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var data struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(ev.Data, &data); err != nil || ev.Event != EventJobUpdated || data.ID != "job-1" {
+			t.Fatalf("event = %+v, data = %+v, error = %v", ev, data, err)
+		}
+	}
+	for _, stream := range streams {
+		_ = stream.Close()
+	}
+	for s.HasSubscribers() && ctx.Err() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	if s.HasSubscribers() {
+		t.Fatal("subscribers remain after clients disconnected")
+	}
 }
 
-func TestBroadcastDropsInsteadOfBlocking(t *testing.T) {
-	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		return struct{}{}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestBroadcastDoesNotBlockOnUnreadSubscription(t *testing.T) {
+	s := &Server{subs: map[chan wireEvent]struct{}{}}
+	ch := make(chan wireEvent, subscriberBuffer)
+	for range subscriberBuffer {
+		ch <- wireEvent{}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = server.Serve(ctx) }()
-
-	stream, err := herdr.New(path).OpenStream(ctx, MethodSubscribe, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = stream.Close() }()
-
-	// Nothing reads the stream. Broadcast must not block once the subscriber's
-	// buffer fills: it is called from the job queue, which would otherwise
-	// stall behind a popup that stopped reading.
+	s.subs[ch] = struct{}{}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range subscriberBuffer * 3 {
-			server.Broadcast(EventJobOutput, map[string]string{"job_id": "job-1"})
-		}
+		s.Broadcast(EventJobOutput, nil)
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Broadcast blocked on a subscriber that stopped reading")
+	case <-time.After(time.Second):
+		t.Fatal("broadcast blocked on an unread subscription")
 	}
 }
 
-func TestServeReturnsWithSubscribersStillConnected(t *testing.T) {
+func TestServeStopsWithOpenSubscription(t *testing.T) {
 	path := socketPath(t)
-	server, err := Listen(path, func(context.Context, string, json.RawMessage) (any, error) {
-		return struct{}{}, nil
-	})
+	s, err := Listen(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx) }()
-
+	go func() { done <- s.Serve(ctx) }()
 	stream, err := herdr.New(path).OpenStream(ctx, MethodSubscribe, nil)
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	defer func() { _ = stream.Close() }()
-
-	// Ending the context must end Serve even though a subscription is open.
-	// The daemon hands over to a newer build this way, and a Serve that waited
-	// for the subscriber would hold the instance lock forever.
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Serve returned %v, want nil", err)
+			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Serve did not return while a subscription was open")
+		t.Fatal("Serve waited for an open subscription")
 	}
 }

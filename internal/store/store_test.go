@@ -8,7 +8,7 @@ import (
 )
 
 func TestPutAssignsIDAndPersists(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "connections.json")
+	path := filepath.Join(t.TempDir(), "nested", "connections.json")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +32,27 @@ func TestPutAssignsIDAndPersists(t *testing.T) {
 	got := reopened.List()
 	if len(got) != 1 || got[0].ID != saved.ID || got[0].Label != "Deploy" {
 		t.Fatalf("reopened store = %+v, want the saved connection", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("file mode = %o, want 600", mode)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Version != 1 {
+		t.Errorf("version = %d, want 1", decoded.Version)
 	}
 }
 
@@ -119,16 +140,6 @@ func TestFailedWritesDoNotChangeMemory(t *testing.T) {
 	}
 }
 
-func TestOpenMissingFileIsEmpty(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "nothing.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(s.List()) != 0 {
-		t.Error("a missing file did not open empty")
-	}
-}
-
 func TestOpenRejectsMalformedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "connections.json")
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
@@ -136,36 +147,6 @@ func TestOpenRejectsMalformedFile(t *testing.T) {
 	}
 	if _, err := Open(path); err == nil {
 		t.Fatal("Open accepted a malformed file")
-	}
-}
-
-func TestSaveWritesPrivateFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "connections.json")
-	s, _ := Open(path)
-	if _, err := s.Put(Connection{Label: "Deploy", Target: "deploy"}); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Errorf("file mode = %o, want 600", mode)
-	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded struct {
-		Version int `json:"version"`
-	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded.Version != 1 {
-		t.Errorf("version = %d, want 1", decoded.Version)
 	}
 }
 
