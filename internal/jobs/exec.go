@@ -25,6 +25,10 @@ const (
 // screen, before that line is treated as a prompt waiting for an answer.
 const promptIdle = 1500 * time.Millisecond
 
+// Keep only the end of an unterminated line for prompt detection. A remote
+// command can otherwise exhaust the daemon's memory by writing without '\n'.
+const maxPendingBytes = 4096
+
 // killGrace is how long a cancelled command has to act on SIGTERM before it is
 // killed. Without it a command that ignores the signal would hold its
 // connection's lane forever.
@@ -98,6 +102,7 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 	}()
 
 	var pending string
+	truncated := false
 	waiting := false
 	idle := time.NewTimer(promptIdle)
 	defer idle.Stop()
@@ -110,6 +115,7 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 			sink.Lines([]string{text})
 		}
 		pending = ""
+		truncated = false
 		if _, err := io.WriteString(f, reply); err != nil {
 			return fmt.Errorf("jobs: cannot answer the prompt: %w", err)
 		}
@@ -134,12 +140,20 @@ func execPTY(ctx context.Context, spec Spec, sink Sink) (int, error) {
 			if cut := strings.LastIndexByte(pending, '\n'); cut >= 0 {
 				sink.Lines(splitLines(pending[:cut+1]))
 				pending = pending[cut+1:]
+				truncated = false
 				// The line the prompt was on has ended, so there is no longer
 				// a prompt on screen. Output that does not end the line —
 				// progress dots, a spinner — leaves the job waiting.
 				if waiting {
 					waiting = false
 					sink.Prompt("")
+				}
+			}
+			if len(pending) > maxPendingBytes {
+				pending = pending[len(pending)-maxPendingBytes:]
+				if !truncated {
+					sink.Lines([]string{"[long output line truncated]"})
+					truncated = true
 				}
 			}
 			if reply, ok := matchAnswer(spec.Answers, pending); ok {

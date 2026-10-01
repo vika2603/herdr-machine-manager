@@ -95,28 +95,33 @@ func (s *Store) Put(c Connection) (Connection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	next := append([]Connection(nil), s.conns...)
 	now := time.Now().UTC()
 	c.Updated = now
 	if c.ID == "" {
 		c.ID = newID()
 		c.Created = now
-		s.conns = append(s.conns, c)
+		next = append(next, c)
 	} else {
 		found := false
-		for i := range s.conns {
-			if s.conns[i].ID == c.ID {
-				c.Created = s.conns[i].Created
-				s.conns[i] = c
+		for i := range next {
+			if next[i].ID == c.ID {
+				c.Created = next[i].Created
+				next[i] = c
 				found = true
 				break
 			}
 		}
 		if !found {
 			c.Created = now
-			s.conns = append(s.conns, c)
+			next = append(next, c)
 		}
 	}
-	return c, s.save()
+	if err := s.save(next); err != nil {
+		return Connection{}, err
+	}
+	s.conns = next
+	return c, nil
 }
 
 // Delete removes a connection.
@@ -125,19 +130,26 @@ func (s *Store) Delete(id string) error {
 	defer s.mu.Unlock()
 	for i := range s.conns {
 		if s.conns[i].ID == id {
-			s.conns = append(s.conns[:i], s.conns[i+1:]...)
-			return s.save()
+			next := make([]Connection, 0, len(s.conns)-1)
+			next = append(next, s.conns[:i]...)
+			next = append(next, s.conns[i+1:]...)
+			if err := s.save(next); err != nil {
+				return err
+			}
+			s.conns = next
+			return nil
 		}
 	}
 	return ErrNotFound
 }
 
-// save writes the file. The caller holds the lock.
-func (s *Store) save() error {
+// save writes the candidate file. The caller holds the lock and publishes the
+// new in-memory state only after the file has been replaced successfully.
+func (s *Store) save(next []Connection) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(file{Version: fileVersion, Connections: s.conns}, "", "  ")
+	raw, err := json.MarshalIndent(file{Version: fileVersion, Connections: next}, "", "  ")
 	if err != nil {
 		return err
 	}

@@ -276,17 +276,33 @@ func (d *Daemon) save(ctx context.Context, p ipc.SaveParams) (ipc.SaveResult, er
 	}
 
 	var queued []string
+	var queueErr error
 	switch {
 	case !existed:
-		queued = d.enqueue(d.connectSpec(saved, p.Install))
+		queued, queueErr = d.enqueue(d.connectSpec(saved, p.Install))
 	case saved.ProfileID == "":
 		// Not held by herdr: the store is all there is to update.
 	case previous.Target != saved.Target || previous.Session != saved.Session:
-		queued = d.enqueue(d.disconnectSpec(saved), d.connectSpec(saved, p.Install))
+		queued, queueErr = d.enqueue(d.disconnectSpec(saved), d.connectSpec(saved, p.Install))
 	case previous.Label != saved.Label:
-		queued = d.enqueue(d.renameSpec(saved))
+		queued, queueErr = d.enqueue(d.renameSpec(saved))
 	}
 
+	if queueErr != nil {
+		// No jobs from this save were accepted. Restore the old settings so
+		// retrying the form still queues the intended operation.
+		var rollbackErr error
+		if existed {
+			_, rollbackErr = d.store.Put(previous)
+		} else {
+			rollbackErr = d.store.Delete(saved.ID)
+		}
+		d.refresh(ctx)
+		if rollbackErr != nil {
+			return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v; rollback failed: %v", queueErr, rollbackErr)
+		}
+		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v", queueErr)
+	}
 	d.refresh(ctx)
 	return ipc.SaveResult{ID: saved.ID, Jobs: queued}, nil
 }
@@ -299,37 +315,41 @@ func (d *Daemon) act(ctx context.Context, method string, p ipc.ConnectionTarget)
 	merged, _ := d.connection(p.ID)
 
 	var queued []string
+	var queueErr error
 	switch method {
 	case ipc.MethodConnect:
 		if merged.Active {
 			return ipc.SaveResult{ID: conn.ID}, nil
 		}
-		queued = d.enqueue(d.connectSpec(conn, p.Install))
+		queued, queueErr = d.enqueue(d.connectSpec(conn, p.Install))
 
 	case ipc.MethodDisconnect:
 		if !merged.Active {
 			return ipc.SaveResult{ID: conn.ID}, nil
 		}
-		queued = d.enqueue(d.disconnectSpec(conn))
+		queued, queueErr = d.enqueue(d.disconnectSpec(conn))
 
 	case ipc.MethodForget:
-		queued = d.enqueue(d.forgetSpec(conn))
+		queued, queueErr = d.enqueue(d.forgetSpec(conn))
 	}
 
 	d.refresh(ctx)
+	if queueErr != nil {
+		return ipc.SaveResult{}, ipc.Errorf(ipc.CodeInternal, "job not queued: %v", queueErr)
+	}
 	return ipc.SaveResult{ID: conn.ID, Jobs: queued}, nil
 }
 
-func (d *Daemon) enqueue(specs ...jobs.Spec) []string {
-	var ids []string
-	for _, spec := range specs {
-		job, err := d.queue.Submit(spec)
-		if err != nil {
-			continue
-		}
+func (d *Daemon) enqueue(specs ...jobs.Spec) ([]string, error) {
+	queued, err := d.queue.SubmitBatch(specs...)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(queued))
+	for _, job := range queued {
 		ids = append(ids, job.ID)
 	}
-	return ids
+	return ids, nil
 }
 
 // refresh reloads herdr's list, reconciles it with the store and broadcasts

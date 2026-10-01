@@ -185,16 +185,49 @@ func TestJobsOfOneConnectionRunInOrder(t *testing.T) {
 			return nil
 		}
 	}
-	first, _ := q.Submit(Spec{Kind: KindDisconnect, Title: "disconnect", ConnID: "c1", Run: record("disconnect")})
-	second, _ := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1", Run: record("connect")})
+	queued, err := q.SubmitBatch(
+		Spec{Kind: KindDisconnect, Title: "disconnect", ConnID: "c1", Run: record("disconnect")},
+		Spec{Kind: KindConnect, Title: "connect", ConnID: "c1", Run: record("connect")},
+	)
+	if err != nil || len(queued) != 2 {
+		t.Fatalf("SubmitBatch = %+v, %v; want both jobs", queued, err)
+	}
 
 	waitFor(t, "both jobs to finish", func() bool {
-		return rec.state(first.ID).Terminal() && rec.state(second.ID).Terminal()
+		return rec.state(queued[0].ID).Terminal() && rec.state(queued[1].ID).Terminal()
 	})
 	mu.Lock()
 	defer mu.Unlock()
 	if len(order) != 2 || order[0] != "disconnect" || order[1] != "connect" {
 		t.Errorf("order = %v, want the reconnect pair in submission order", order)
+	}
+}
+
+func TestReconnectBatchIsAllOrNothingWhenLaneIsNearlyFull(t *testing.T) {
+	q, rec := newTestQueue(t)
+	release := make(chan struct{})
+	blocker, err := q.Submit(Spec{ConnID: "c1", Kind: KindConnect, Title: "blocker",
+		Run: func(context.Context, Sink) error { <-release; return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(release)
+	waitFor(t, "blocker to start", func() bool { return rec.state(blocker.ID) == StateRunning })
+	for range laneDepth - 1 {
+		if _, err := q.Submit(Spec{ConnID: "c1", Kind: KindRename, Title: "queued",
+			Run: func(context.Context, Sink) error { return nil }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(q.List())
+	if _, err := q.SubmitBatch(
+		Spec{ConnID: "c1", Kind: KindDisconnect, Title: "disconnect"},
+		Spec{ConnID: "c1", Kind: KindConnect, Title: "connect"},
+	); err == nil {
+		t.Fatal("batch accepted without room for both jobs")
+	}
+	if got := len(q.List()); got != before {
+		t.Errorf("batch partially queued: %d jobs, want %d", got, before)
 	}
 }
 
@@ -355,6 +388,27 @@ func TestOutputDoesNotClearAPendingPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the job to finish", func() bool { return rec.state(job.ID).Terminal() })
+}
+
+func TestLongUnterminatedOutputKeepsPromptBounded(t *testing.T) {
+	q, rec := newTestQueue(t)
+	job, err := q.Submit(Spec{Kind: KindConnect, Title: "connect", ConnID: "c1",
+		Args: script(t, "printf '%50000s' x\nprintf 'passphrase: '\nread p\necho done\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the prompt after the long output", func() bool { return rec.state(job.ID) == StateAwaitingInput })
+	current := q.List()[0]
+	if !strings.Contains(current.Prompt, "passphrase:") || len(current.Prompt) > maxPendingBytes {
+		t.Errorf("prompt length = %d, tail = %q; want a bounded prompt", len(current.Prompt), current.Prompt[max(0, len(current.Prompt)-60):])
+	}
+	if !strings.Contains(strings.Join(current.Tail, "\n"), "[long output line truncated]") {
+		t.Errorf("no truncation notice in output: %q", current.Tail)
+	}
+	if err := q.Input(job.ID, "secret\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job to finish", func() bool { return rec.state(job.ID).Terminal() })
 }
 
 func TestInputIsRefusedWhenNoPromptIsPending(t *testing.T) {

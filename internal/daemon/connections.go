@@ -25,8 +25,25 @@ func (d *Daemon) reconcile(actual []machines.Machine) []Connection {
 	taken := make(map[string]bool, len(actual))
 	out := make([]Connection, 0, len(stored))
 
+	// Reserve known endpoint IDs before trying the target/label fallback.
+	// Otherwise an offline duplicate can claim another connection's endpoint.
+	byID := make(map[string]machines.Machine, len(actual))
+	for _, machine := range actual {
+		byID[machine.ID] = machine
+	}
+	matched := make(map[string]machines.Machine, len(stored))
 	for _, conn := range stored {
-		machine, ok := matchMachine(actual, conn, taken)
+		if machine, ok := byID[conn.ProfileID]; ok && conn.ProfileID != "" && !taken[machine.ID] {
+			matched[conn.ID] = machine
+			taken[machine.ID] = true
+		}
+	}
+
+	for _, conn := range stored {
+		machine, ok := matched[conn.ID]
+		if !ok {
+			machine, ok = matchMachine(actual, conn, taken)
+		}
 		if ok {
 			taken[machine.ID] = true
 			if conn.ProfileID != machine.ID {
@@ -65,17 +82,9 @@ func (d *Daemon) reconcile(actual []machines.Machine) []Connection {
 	return out
 }
 
-// matchMachine pairs a stored connection with a herdr machine, by endpoint id
-// when one is recorded and by target and label otherwise, which is what a
-// freshly added machine matches on before its id is known.
+// matchMachine pairs an unmatched stored connection by target and label,
+// after existing endpoint IDs have been reserved for their owners.
 func matchMachine(actual []machines.Machine, conn store.Connection, taken map[string]bool) (machines.Machine, bool) {
-	if conn.ProfileID != "" {
-		for _, machine := range actual {
-			if machine.ID == conn.ProfileID && !taken[machine.ID] {
-				return machine, true
-			}
-		}
-	}
 	for _, machine := range actual {
 		if !taken[machine.ID] && machine.Target == conn.Target && machine.Label == conn.Label {
 			return machine, true

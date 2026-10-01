@@ -84,6 +84,41 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestFailedWritesDoNotChangeMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connections.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := s.Put(Connection{Label: "Deploy", Target: "deploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The temporary file can be created, but cannot replace a directory.
+	// This exercises a failure after the candidate state was built.
+	s.path = t.TempDir()
+	if _, err := s.Put(Connection{ID: original.ID, Label: "Changed", Target: "deploy"}); err == nil {
+		t.Fatal("update unexpectedly succeeded")
+	}
+	if _, err := s.Put(Connection{Label: "New", Target: "new"}); err == nil {
+		t.Fatal("insert unexpectedly succeeded")
+	}
+	if err := s.Delete(original.ID); err == nil {
+		t.Fatal("delete unexpectedly succeeded")
+	}
+	if got := s.List(); len(got) != 1 || got[0] != original {
+		t.Fatalf("failed writes changed memory: %+v", got)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.List(); len(got) != 1 || got[0] != original {
+		t.Fatalf("disk and memory disagree: %+v", got)
+	}
+}
+
 func TestOpenMissingFileIsEmpty(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "nothing.json"))
 	if err != nil {

@@ -64,37 +64,56 @@ func NewQueue(ctx context.Context, hooks Hooks) *Queue {
 
 // Submit accepts a job and returns it in its queued state.
 func (q *Queue) Submit(spec Spec) (Job, error) {
-	id := fmt.Sprintf("job-%d", q.ids.Add(1))
-	st := &state{
-		job: Job{
-			ID:     id,
-			Kind:   spec.Kind,
-			Title:  spec.Title,
-			ConnID: spec.ConnID,
-			State:  StateQueued,
-		},
-		spec:  spec,
-		input: make(chan string, 1),
+	jobs, err := q.SubmitBatch(spec)
+	if err != nil {
+		return Job{}, err
 	}
+	return jobs[0], nil
+}
 
-	// Registering the job and handing it to its lane happen under one lock:
-	// the lane worker retires itself under the same lock, so a job can never
-	// be delivered to a channel nobody reads.
+// SubmitBatch queues jobs for one connection atomically: a reconnect must
+// never enqueue its disconnect unless there is room for its connect too.
+func (q *Queue) SubmitBatch(specs ...Spec) ([]Job, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
 	q.mu.Lock()
-	lane := q.lane(spec.ConnID)
-	select {
-	case lane <- id:
-	default:
+	if err := q.ctx.Err(); err != nil {
 		q.mu.Unlock()
-		return Job{}, fmt.Errorf("jobs: %s already has %d jobs queued", spec.Title, laneDepth)
+		return nil, err
 	}
-	q.byID[id] = st
-	q.order = append(q.order, id)
-	event := st.event()
+	connID := specs[0].ConnID
+	for _, spec := range specs[1:] {
+		if spec.ConnID != connID {
+			q.mu.Unlock()
+			return nil, errors.New("jobs: batch spans multiple connections")
+		}
+	}
+	// Registering jobs and handing them to the worker happen under one lock.
+	// The worker retires under that lock, so no job goes to an idle channel.
+	lane := q.lane(connID)
+	if len(specs) > cap(lane)-len(lane) {
+		q.mu.Unlock()
+		return nil, fmt.Errorf("jobs: %s already has too many jobs queued (limit %d)", specs[0].Title, laneDepth)
+	}
+	out := make([]Job, 0, len(specs))
+	for _, spec := range specs {
+		id := fmt.Sprintf("job-%d", q.ids.Add(1))
+		st := &state{
+			job:   Job{ID: id, Kind: spec.Kind, Title: spec.Title, ConnID: spec.ConnID, State: StateQueued},
+			spec:  spec,
+			input: make(chan string, 1),
+		}
+		q.byID[id] = st
+		q.order = append(q.order, id)
+		lane <- id
+		out = append(out, st.event())
+	}
 	q.mu.Unlock()
-
-	q.hooks.OnUpdate(event)
-	return event, nil
+	for _, job := range out {
+		q.hooks.OnUpdate(job)
+	}
+	return out, nil
 }
 
 // List returns the jobs the queue still holds, oldest first, each with the

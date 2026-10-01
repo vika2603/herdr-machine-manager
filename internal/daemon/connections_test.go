@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/vika2603/herdr-machine-manager/internal/ipc"
 	"github.com/vika2603/herdr-machine-manager/internal/jobs"
 	"github.com/vika2603/herdr-machine-manager/internal/machines"
 	"github.com/vika2603/herdr-machine-manager/internal/store"
@@ -129,6 +131,29 @@ func TestReconcilePrefersTheRecordedEndpointID(t *testing.T) {
 	}
 }
 
+func TestReconcileReservesExistingIDBeforeMatchingDuplicate(t *testing.T) {
+	d := newTestDaemon(t)
+	removed, _ := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "id-1"})
+	remaining, _ := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "id-2"})
+
+	conns := d.reconcile([]machines.Machine{{ID: "id-2", Label: "Deploy", Target: "deploy"}})
+	if len(conns) != 2 {
+		t.Fatalf("connections = %+v, want two", conns)
+	}
+	for _, conn := range conns {
+		switch conn.ID {
+		case removed.ID:
+			if conn.Active || conn.ProfileID != "" {
+				t.Errorf("removed connection claimed the remaining endpoint: %+v", conn)
+			}
+		case remaining.ID:
+			if !conn.Active || conn.ProfileID != "id-2" {
+				t.Errorf("remaining connection lost its endpoint: %+v", conn)
+			}
+		}
+	}
+}
+
 func TestReconcileMatchesANewConnectionByTargetAndLabel(t *testing.T) {
 	d := newTestDaemon(t)
 	// A connect job has just run: the store has no endpoint id yet, because
@@ -174,6 +199,45 @@ func fakeHerdr(t *testing.T, listJSON string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestSaveReportsQueueFailureWithoutPartialReconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newTestDaemon(t)
+	original, err := d.store.Put(store.Connection{Label: "Deploy", Target: "deploy", ProfileID: "ep-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.cli = machines.CLI{Bin: fakeHerdr(t, `[{"id":"ep-1","label":"Deploy","target":"deploy"}]`)}
+	d.queue = jobs.NewQueue(ctx, jobs.Hooks{})
+	d.conns = []Connection{{Connection: original, Active: true}}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	_, err = d.queue.Submit(jobs.Spec{ConnID: original.ID, Kind: jobs.KindConnect,
+		Run: func(context.Context, jobs.Sink) error { close(started); <-release; return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(release)
+	<-started
+	for range 7 { // One free lane slot is insufficient for both reconnect jobs.
+		if _, err := d.queue.Submit(jobs.Spec{ConnID: original.ID, Kind: jobs.KindRename,
+			Run: func(context.Context, jobs.Sink) error { return nil }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(d.queue.List())
+	_, err = d.save(ctx, ipc.SaveParams{ID: original.ID, Label: "Deploy", Target: "new-target"})
+	if err == nil || !strings.Contains(err.Error(), "job not queued") {
+		t.Fatalf("save error = %v, want a visible queue failure", err)
+	}
+	if got := len(d.queue.List()); got != before {
+		t.Errorf("save queued only part of reconnect: %d jobs, want %d", got, before)
+	}
+	if saved, _ := d.store.Get(original.ID); saved.Target != original.Target {
+		t.Errorf("failed save changed target to %q; retry would not queue a reconnect", saved.Target)
+	}
 }
 
 func TestConcurrentRefreshAdoptsAMachineOnce(t *testing.T) {
