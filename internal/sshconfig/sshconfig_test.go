@@ -48,6 +48,17 @@ func TestAliases(t *testing.T) {
 			},
 		},
 		{
+			name: "trailing comments end the argument list",
+			path: "comments/config",
+			want: []wantAlias{
+				{"included-host", "comments/inc/a.conf"},
+				{"lazyssh-host", "comments/config"},
+				{"spaced-comment", "comments/config"},
+				{"#quoted-hash", "comments/config"},
+				{"hash#inside", "comments/config"},
+			},
+		},
+		{
 			name: "include glob nested and missing",
 			path: "include/config",
 			want: []wantAlias{

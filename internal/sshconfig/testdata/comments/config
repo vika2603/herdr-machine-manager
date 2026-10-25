@@ -1,0 +1,8 @@
+# A whole-line comment declares nothing.
+Include inc/*.conf # trailing comment on an Include
+
+Host lazyssh-host    #Added by lazyssh
+  HostName lazyssh.example
+
+Host spaced-comment # reached through the bastion
+Host "#quoted-hash" hash#inside #trailing
