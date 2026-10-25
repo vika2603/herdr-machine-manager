@@ -126,6 +126,9 @@ func splitKeyword(line string) (keyword, rest string) {
 	return line[:i], rest
 }
 
+// splitArgs splits the arguments of a line. An unquoted '#' that starts an
+// argument begins a comment and ends the list, as in OpenSSH's argv_split;
+// a '#' inside an argument or a quoted one is part of the argument.
 func splitArgs(s string) []string {
 	var (
 		args   []string
@@ -133,6 +136,9 @@ func splitArgs(s string) []string {
 		quoted bool
 	)
 	for _, r := range s {
+		if r == '#' && !quoted && cur.Len() == 0 {
+			break
+		}
 		switch {
 		case r == '"':
 			quoted = !quoted
